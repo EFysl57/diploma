@@ -185,12 +185,29 @@ class SmartPalletizing5(CortexBase):
     def setup_scene(self):
         world = self.get_world()
         env_path = "/World/Ur10Table"
+        stage = omni.usd.get_context().get_stage()
+
+        # 1. Удаляем только старые коробки из текущей открытой сцены
+        bins_root = stage.GetPrimAtPath(f"{env_path}/bins")
+        if bins_root.IsValid():
+            stage.RemovePrim(f"{env_path}/bins")
+
+        # Страховка: если при перезапуске остались примы bin_* в сцене
+        for prim in list(stage.Traverse()):
+            path_str = str(prim.GetPath())
+            if "/bins/bin_" in path_str:
+                stage.RemovePrim(path_str)
+
+        # 2. Если стол UR10 и фон уже есть в открытом .usd файле — не дублируем их
         ur10_assets = Ur10Assets()
-        add_reference_to_stage(usd_path=ur10_assets.ur10_table_usd, prim_path=env_path)
-        add_reference_to_stage(usd_path=ur10_assets.background_usd, prim_path="/World/Background")
-        SingleXFormPrim(
-            "/World/Background", position=[10.00, 2.00, -1.18180], orientation=[0.7071, 0, 0, 0.7071]
-        )
+        if not stage.GetPrimAtPath(env_path).IsValid():
+            add_reference_to_stage(usd_path=ur10_assets.ur10_table_usd, prim_path=env_path)
+        if not stage.GetPrimAtPath("/World/Background").IsValid():
+            add_reference_to_stage(usd_path=ur10_assets.background_usd, prim_path="/World/Background")
+            SingleXFormPrim(
+                "/World/Background", position=[10.00, 2.00, -1.18180], orientation=[0.7071, 0, 0, 0.7071]
+            )
+
         self.robot = world.add_robot(CortexUr10(name="robot", prim_path=f"{env_path}/ur10"))
 
         # Planning obstacles for Cortex motion planner
@@ -249,35 +266,37 @@ class SmartPalletizing5(CortexBase):
                     color=np.array([1.0, 0.6, 0.0]),
                 )
             )
+    def _clear_pallet_only(self):
+        """Clear physical bins and cleanly reset BinStackingContext without touching the robot arm."""
+        if hasattr(self, "decider_network") and self.decider_network is not None:
+            ctx = getattr(self.decider_network, "context", None)
+            if ctx is not None:
+                # 1. Пробуем вызвать штатный метод reset() самого контекста bin_stacking_behavior
+                if hasattr(ctx, "reset") and callable(ctx.reset):
+                    ctx.reset()
+                else:
+                    # 2. Если reset() нет, сбрасываем все поля состояния активной коробки и слотов
+                    for attr in ("active_bin", "in_flip_station", "grasp_bin"):
+                        if hasattr(ctx, attr):
+                            setattr(ctx, attr, None)
+                    for bool_attr in ("has_active_bin", "is_bin_grasped", "is_pallet_full"):
+                        if hasattr(ctx, bool_attr):
+                            setattr(ctx, bool_attr, False)
+                    for list_attr in ("bins", "stacked_bins", "registered_bins"):
+                        if hasattr(ctx, list_attr):
+                            getattr(ctx, list_attr).clear()
 
-    def _reset_pallet_and_cortex(self):
-        """Clean up bins and re-initialize robot commander + Cortex for the next cycle."""
-        # 1. Удаляем все старые коробки
+        # 3. Удаляем физические коробки со сцены и разрешаем спавн новых
         if self.task:
             self.task.post_reset()
 
-        world = self.get_world()
-        if world and self.robot:
-            # 2. Сбрасываем присоску и контроллер движения руки (RMPflow / Commander)
-            try:
-                self.robot.suction_gripper.release()
-            except Exception:
-                pass
-            
-            self.robot.post_reset()
-            if hasattr(self.robot, "commander") and self.robot.commander is not None:
-                self.robot.commander.reset()
+        print("[LOGISTICS] Pallet and behavior context cleared. Ready for new bins.")
 
-            # 3. Пересобираем логику Cortex и заново "включаем" её
-            world._behaviors.clear()
-            world._logical_state_monitors.clear()
-            if hasattr(world, "_df_logical_state"):
-                world._df_logical_state.clear()
+        # 2. Удаляем старые коробки со сцены и разрешаем спавн новых
+        if self.task:
+            self.task.post_reset()
 
-            self.decider_network = behavior.make_decider_network(self.robot, self._on_monitor_update)
-            world.add_decider_network(self.decider_network)
-            world.reset_cortex()
-            print("[CORTEX] Robot arm re-initialized and ready for Cycle 2.")
+        print("[LOGISTICS] Pallet cleared. Robot arm remains active and ready for new bins.")
     async def setup_post_load(self):
         world = self.get_world()
         env_path = "/World/Ur10Table"
@@ -310,7 +329,7 @@ class SmartPalletizing5(CortexBase):
         self._frame_counter += 1
 
         # 1. Update AGV logistics
-        self.agv.update(step_size, spawner_reset_callback=self._reset_pallet_and_cortex)
+        self.agv.update(step_size, spawner_reset_callback=self._clear_pallet_only)
 
         # 2. Evaluate safety zones every 30 frames
         if self._frame_counter % 30 == 0:
@@ -360,11 +379,18 @@ class SmartPalletizing5(CortexBase):
 # ==============================================================================
 # 4. STANDALONE LAUNCHER FOR ISAAC SIM SCRIPT EDITOR
 # ==============================================================================
+# ==============================================================================
+# 4. STANDALONE LAUNCHER FOR ISAAC SIM SCRIPT EDITOR
+# ==============================================================================
 async def run_standalone():
     try:
         from isaacsim.cortex.framework.cortex_world import CortexWorld
 
-        # Clear previous world instance if re-running the script
+        # Останавливаем таймлайн перед зачисткой старых коробок
+        timeline = omni.timeline.get_timeline_interface()
+        timeline.stop()
+        await omni.kit.app.get_app().next_update_async()
+
         if CortexWorld.instance():
             CortexWorld.instance().clear_instance()
 
@@ -374,18 +400,17 @@ async def run_standalone():
         app = SmartPalletizing5()
         app._world = world
 
-        print("[SYSTEM] Building scene and loading UR10...")
         app.setup_scene()
         await world.reset_async()
 
-        print("[SYSTEM] Initializing Cortex behavior and custom modules...")
         await app.setup_post_load()
         await app.on_event_async()
 
-        print("[SYSTEM] Simulation started successfully!")
+        print("[SYSTEM] Started on existing stage with old bins cleared!")
     except Exception:
         print("[ERROR] Failed to launch SmartPalletizing5:")
         traceback.print_exc()
 
 
 asyncio.ensure_future(run_standalone())
+
