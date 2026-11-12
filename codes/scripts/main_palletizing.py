@@ -81,6 +81,9 @@ class BinStackingTask(BaseTask):
         self.target_bins_per_pallet = target_bins_per_pallet
         self.pallet_full = False
         self._placing_wait_steps = 0
+# Внутри BinStackingTask.__init__ добавь общий счетчик за всю сессию:
+        self._total_spawned_count = 0
+
 
     def _spawn_bin(self, rigid_bin):
         x, q = random_bin_spawn_transform()
@@ -146,7 +149,8 @@ class BinStackingTask(BaseTask):
                 spawn_new = True
 
         if spawn_new:
-            name = f"bin_{len(self.bins)}"
+            name = f"bin_{self._total_spawned_count}"
+            self._total_spawned_count += 1
             prim_path = f"{self.env_path}/bins/{name}"
             add_reference_to_stage(usd_path=self.assets.small_klt_usd, prim_path=prim_path)
             self.on_conveyor = self.scene.add(CortexRigidPrim(name=name, prim_path=prim_path))
@@ -247,13 +251,33 @@ class SmartPalletizing5(CortexBase):
             )
 
     def _reset_pallet_and_cortex(self):
-        """Clear bins and reset Cortex logical monitors so it forgets deleted prims."""
+        """Clean up bins and re-initialize robot commander + Cortex for the next cycle."""
+        # 1. Удаляем все старые коробки
         if self.task:
             self.task.post_reset()
-        world = self.get_world()
-        if world:
-            world.reset_cortex()
 
+        world = self.get_world()
+        if world and self.robot:
+            # 2. Сбрасываем присоску и контроллер движения руки (RMPflow / Commander)
+            try:
+                self.robot.suction_gripper.release()
+            except Exception:
+                pass
+            
+            self.robot.post_reset()
+            if hasattr(self.robot, "commander") and self.robot.commander is not None:
+                self.robot.commander.reset()
+
+            # 3. Пересобираем логику Cortex и заново "включаем" её
+            world._behaviors.clear()
+            world._logical_state_monitors.clear()
+            if hasattr(world, "_df_logical_state"):
+                world._df_logical_state.clear()
+
+            self.decider_network = behavior.make_decider_network(self.robot, self._on_monitor_update)
+            world.add_decider_network(self.decider_network)
+            world.reset_cortex()
+            print("[CORTEX] Robot arm re-initialized and ready for Cycle 2.")
     async def setup_post_load(self):
         world = self.get_world()
         env_path = "/World/Ur10Table"
