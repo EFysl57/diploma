@@ -11,7 +11,7 @@ class SafetyDecisionModule:
             return "NORMAL", "Zone is clear"
 
         highest_priority_state = "NORMAL"
-        status_message = "Norman status"
+        status_message = "Normal status"
 
         for obj in detected_objects:
             obj_class = obj.get("class", "unknown")
