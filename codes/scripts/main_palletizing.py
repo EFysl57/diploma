@@ -1,15 +1,22 @@
 import asyncio
 import importlib
+import importlib.util
 import os
 import random
+import shutil
 import sys
 import traceback
+
+sys.dont_write_bytecode = True
 
 import isaacsim.cortex.framework.math_util as math_util
 import numpy as np
 import omni
+import omni.client
+import omni.kit.app
+import omni.kit.commands
+import omni.timeline
 import omni.usd
-from isaacsim.core.api.objects import VisualCuboid
 from isaacsim.core.api.objects.capsule import VisualCapsule
 from isaacsim.core.api.objects.sphere import VisualSphere
 from isaacsim.core.api.tasks.base_task import BaseTask
@@ -20,25 +27,37 @@ from isaacsim.cortex.framework.cortex_rigid_prim import CortexRigidPrim
 from isaacsim.cortex.framework.cortex_utils import get_assets_root_path
 from isaacsim.cortex.framework.robot import CortexUr10
 from isaacsim.examples.interactive.cortex.cortex_base import CortexBase
+from pxr import Gf, Sdf, UsdGeom, UsdLux
 
 # ==============================================================================
-# 1. IMPORT LOCAL MODULES (safety_module, agv_manager, camera_sensor)
+# 1. FORCE FRESH IMPORT OF LOCAL MODULES
 # ==============================================================================
-SCRIPTS_DIR = os.path.abspath(r"D:\дипломка\codes\scripts")
+SCRIPTS_DIR = os.path.abspath(r"D:\diploma\codes\scripts")
 if os.path.exists(SCRIPTS_DIR) and SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
+
+pycache_dir = os.path.join(SCRIPTS_DIR, "__pycache__")
+if os.path.exists(pycache_dir):
+    shutil.rmtree(pycache_dir, ignore_errors=True)
+
+for _mod_name in ("safety_module", "agv_manager", "camera_sensor"):
+    sys.modules.pop(_mod_name, None)
+importlib.invalidate_caches()
 
 safety_module = importlib.import_module("safety_module")
 agv_manager = importlib.import_module("agv_manager")
 camera_sensor = importlib.import_module("camera_sensor")
 
-importlib.reload(safety_module)
-importlib.reload(agv_manager)
-importlib.reload(camera_sensor)
-
 SafetyDecisionModule = safety_module.SafetyDecisionModule
 AGVManager = agv_manager.AGVManager
-SafetyCamera = camera_sensor.SafetyCamera
+AGVFleetManager = getattr(agv_manager, "AGVFleetManager", None)
+DualContourCameraSystem = getattr(camera_sensor, "DualContourCameraSystem", None)
+
+if AGVFleetManager is None or DualContourCameraSystem is None:
+    raise RuntimeError(
+        f"Missing AGVFleetManager={AGVFleetManager is None}, "
+        f"Missing DualContourCameraSystem={DualContourCameraSystem is None}"
+    )
 
 
 class Ur10Assets:
@@ -49,86 +68,134 @@ class Ur10Assets:
         )
         self.small_klt_usd = self.assets_root_path + "/Isaac/Props/KLT_Bin/small_KLT.usd"
         self.background_usd = self.assets_root_path + "/Isaac/Environments/Simple_Warehouse/warehouse.usd"
+        self.iw_hub_usd = self.assets_root_path + "/Isaac/Robots/Idealworks/iwhub/iwhub.usd"
 
 
 def random_bin_spawn_transform():
-    x = random.uniform(-0.15, 0.15)
-    y = 1.5
+    x = random.uniform(-0.10, 0.10)
+    y = 1.50
     z = -0.15
-    position = np.array([x, y, z])
+    position = np.array([x, y, z], dtype=float)
 
     z_rot = random.random() * 0.02 - 0.01
     w_rot = random.random() * 0.02 - 0.01
     norm = np.sqrt(z_rot**2 + w_rot**2)
-    quat = math_util.Quaternion([w_rot / norm, 0, 0, z_rot / norm])
+    quat = math_util.Quaternion([w_rot / norm, 0.0, 0.0, z_rot / norm])
     if random.random() > 0.5:
-        quat = quat * math_util.Quaternion([0, 0, 1, 0])
+        quat = quat * math_util.Quaternion([0.0, 0.0, 1.0, 0.0])
 
     return position, quat.vals
 
 
+def setup_scene_lighting(stage) -> None:
+    """Create persistent warehouse DomeLight + DistantLight so viewport never goes dark on reset."""
+    lights_root = "/World/Lights"
+    if not stage.GetPrimAtPath(lights_root).IsValid():
+        UsdGeom.Xform.Define(stage, lights_root)
+    dome = UsdLux.DomeLight.Define(stage, f"{lights_root}/WarehouseDomeLight")
+    dome.CreateIntensityAttr(1000.0)
+    sun = UsdLux.DistantLight.Define(stage, f"{lights_root}/WarehouseSunLight")
+    sun.CreateIntensityAttr(2200.0)
+    xf = UsdGeom.Xformable(sun.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddRotateXYZOp().Set(Gf.Vec3f(35.0, 25.0, 0.0))
+
+
+def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule) -> None:
+    """Create 3 floor safety zones (Red, Yellow, Green) around the UR10 palletizing cell."""
+    ox, oy = safety_inst.robot_origin
+    floor_z = -1.175
+
+    zones_spec = [
+        ("RedZone_UR10", safety_inst.red_radius, floor_z + 0.004, (0.95, 0.12, 0.12), 0.35),
+        ("YellowZone_Buffer", safety_inst.yellow_radius, floor_z + 0.002, (0.98, 0.78, 0.08), 0.25),
+        ("GreenZone_Logistics", 3.60, floor_z + 0.001, (0.12, 0.85, 0.28), 0.18),
+    ]
+
+    zones_root = "/World/SafetyZones"
+    UsdGeom.Xform.Define(stage, zones_root)
+
+    for zone_name, radius, z_pos, rgb, opacity in zones_spec:
+        prim_path = f"{zones_root}/{zone_name}"
+        cyl = UsdGeom.Cylinder.Define(stage, prim_path)
+        cyl.CreateRadiusAttr(float(radius))
+        cyl.CreateHeightAttr(0.002)
+        cyl.CreateAxisAttr("Z")
+        cyl.CreateDisplayColorAttr([Gf.Vec3f(*rgb)])
+        cyl.CreateDisplayOpacityAttr([float(opacity)])
+
+        xf = UsdGeom.Xformable(cyl.GetPrim())
+        xf.ClearXformOpOrder()
+        xf.AddTranslateOp().Set(Gf.Vec3d(float(ox), float(oy), float(z_pos)))
+
+    UsdGeom.Xform.Define(stage, "/World/Personnel")
+
+
 # ==============================================================================
-# 2. BIN STACKING TASK WITH PALLET COUNTING AND FULL BIN CLEANUP
+# 2. BIN STACKING TASK (POOL OF 4 REUSABLE BINS FOR RELIABLE MULTI-CYCLE CORTEX)
 # ==============================================================================
 class BinStackingTask(BaseTask):
-    def __init__(self, env_path, assets, target_bins_per_pallet=4) -> None:
+    def __init__(self, env_path: str, assets: Ur10Assets, target_bins_per_pallet: int = 4) -> None:
         super().__init__("bin_stacking")
         self.assets = assets
         self.env_path = env_path
         self.bins = []
-        self.stashed_bins = []
+        self._bin_pool: list[CortexRigidPrim] = []
         self.on_conveyor = None
         self.target_bins_per_pallet = target_bins_per_pallet
         self.pallet_full = False
         self._placing_wait_steps = 0
-# Внутри BinStackingTask.__init__ добавь общий счетчик за всю сессию:
-        self._total_spawned_count = 0
 
-
-    def _spawn_bin(self, rigid_bin):
+    def _spawn_bin(self, rigid_bin: CortexRigidPrim) -> None:
         x, q = random_bin_spawn_transform()
         rigid_bin.set_world_pose(position=x, orientation=q)
-        rigid_bin.set_linear_velocity(np.array([0, -0.30, 0]))
+        rigid_bin.set_linear_velocity(np.array([0.0, -0.30, 0.0]))
+        rigid_bin.set_angular_velocity(np.array([0.0, 0.0, 0.0]))
         rigid_bin.set_visibility(True)
 
-    def clear_all_bins(self) -> None:
-        """Remove all spawned bins from both Isaac Sim scene registry and USD stage."""
-        stage = omni.usd.get_context().get_stage()
+    def _stash_bin(self, idx: int, rigid_bin: CortexRigidPrim) -> None:
+        rigid_bin.set_visibility(False)
+        rigid_bin.set_linear_velocity(np.array([0.0, 0.0, 0.0]))
+        rigid_bin.set_angular_velocity(np.array([0.0, 0.0, 0.0]))
+        rigid_bin.set_world_pose(
+            position=np.array([-8.0 - idx * 0.6, 8.0, -3.5], dtype=float),
+            orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
+        )
 
-        for rigid_bin in self.bins:
+    def reset_pallet_cycle(self) -> None:
+        """Stash all 4 pooled bins off-stage and reset counters without destroying CortexRigidPrims."""
+        for i, rigid_bin in enumerate(self._bin_pool):
+            self._stash_bin(i, rigid_bin)
+        self.bins.clear()
+        self.on_conveyor = None
+        self.pallet_full = False
+        self._placing_wait_steps = 0
+        print("[LOGISTICS] Pallet cleared and 4-bin pool stashed for next cycle.")
+
+    def clear_all_bins(self) -> None:
+        stage = omni.usd.get_context().get_stage()
+        for rigid_bin in list(self._bin_pool):
             try:
                 if self.scene and self.scene.object_exists(rigid_bin.name):
                     self.scene.remove_object(rigid_bin.name)
             except Exception:
                 pass
-
-            try:
-                prim_path = f"{self.env_path}/bins/{rigid_bin.name}"
-                if stage and stage.GetPrimAtPath(prim_path).IsValid():
-                    stage.RemovePrim(prim_path)
-            except Exception:
-                pass
-
-        # Clean up parent /bins container prim to guarantee zero leftover meshes
         try:
             bins_root = f"{self.env_path}/bins"
             if stage and stage.GetPrimAtPath(bins_root).IsValid():
                 stage.RemovePrim(bins_root)
         except Exception:
             pass
-
+        self._bin_pool.clear()
         self.bins.clear()
-        self.stashed_bins.clear()
         self.on_conveyor = None
         self.pallet_full = False
         self._placing_wait_steps = 0
-        print("[LOGISTICS] All bins removed from stage. Pallet is empty and ready.")
 
     def post_reset(self) -> None:
-        """Called during pallet swap or simulation reset."""
-        self.clear_all_bins()
+        self.reset_pallet_cycle()
 
-    def pre_step(self, time_step_index, simulation_time) -> None:
+    def pre_step(self, time_step_index: int, simulation_time: float) -> None:
         if self.pallet_full:
             return
 
@@ -140,7 +207,6 @@ class BinStackingTask(BaseTask):
             is_on_conveyor = y > 0.0 and -0.4 < x < 0.4
             if not is_on_conveyor:
                 if len(self.bins) >= self.target_bins_per_pallet:
-                    # Wait ~3.5 seconds (210 steps at 60 Hz) for the 4th bin to be placed on the pallet
                     self._placing_wait_steps += 1
                     if self._placing_wait_steps >= 210:
                         self.pallet_full = True
@@ -148,24 +214,29 @@ class BinStackingTask(BaseTask):
                     return
                 spawn_new = True
 
-        if spawn_new:
-            name = f"bin_{self._total_spawned_count}"
-            self._total_spawned_count += 1
-            prim_path = f"{self.env_path}/bins/{name}"
-            add_reference_to_stage(usd_path=self.assets.small_klt_usd, prim_path=prim_path)
-            self.on_conveyor = self.scene.add(CortexRigidPrim(name=name, prim_path=prim_path))
+        if spawn_new and len(self.bins) < self.target_bins_per_pallet:
+            slot_idx = len(self.bins)
+            if slot_idx < len(self._bin_pool):
+                rigid_bin = self._bin_pool[slot_idx]
+            else:
+                name = f"bin_{slot_idx}"
+                prim_path = f"{self.env_path}/bins/{name}"
+                add_reference_to_stage(usd_path=self.assets.small_klt_usd, prim_path=prim_path)
+                rigid_bin = self.scene.add(CortexRigidPrim(name=name, prim_path=prim_path))
+                self._bin_pool.append(rigid_bin)
 
+            self.on_conveyor = rigid_bin
             self._spawn_bin(self.on_conveyor)
             self.bins.append(self.on_conveyor)
             self._placing_wait_steps = 0
-            print(f"[SPAWNER] Spawned bin #{len(self.bins)}")
+            print(f"[SPAWNER] Spawned bin #{len(self.bins)} ({rigid_bin.name})")
 
-    def world_cleanup(self):
+    def world_cleanup(self) -> None:
         self.clear_all_bins()
 
 
 # ==============================================================================
-# 3. MAIN CLASS WITH SAFETY, CAMERA, AND AGV INTEGRATION
+# 3. MAIN APPLICATION WITH MULTI-AGV FLEET, DUAL CAMERAS, AND 3-ZONE SAFETY
 # ==============================================================================
 class SmartPalletizing5(CortexBase):
     def __init__(self, monitor_fn=None):
@@ -173,44 +244,99 @@ class SmartPalletizing5(CortexBase):
         self._monitor_fn = monitor_fn
         self.robot = None
         self.task = None
+        self.decider_network = None
 
-        # Custom modules
         self.safety = SafetyDecisionModule()
-        self.agv = AGVManager(agv_prim_path="/agv")
-        self.camera = SafetyCamera()
+        self.cameras = DualContourCameraSystem()
+
+        self.agv_01 = AGVManager(
+            agv_prim_path="/World/iw_hub_01",
+            robot_id="AGV-01",
+            authorized=True,
+            standby_pos=(-3.20, 2.20, -1.175),
+            dropoff_pos=(-3.20, -1.80, -1.175),
+            priority=1,
+        )
+        self.agv_02 = AGVManager(
+            agv_prim_path="/World/iw_hub_02",
+            robot_id="AGV-02",
+            authorized=True,
+            standby_pos=(-3.20, -2.80, -1.175),
+            dropoff_pos=(-3.20, -1.80, -1.175),
+            priority=2,
+        )
+        self.fleet = AGVFleetManager([self.agv_01, self.agv_02])
 
         self._frame_counter = 0
         self._current_safety_state = "NORMAL"
 
-    def setup_scene(self):
+    @staticmethod
+    def purge_stale_bins_from_stage(env_path: str = "/World/Ur10Table") -> None:
+        stage = omni.usd.get_context().get_stage()
+        if not stage:
+            return
+        bins_root = stage.GetPrimAtPath(f"{env_path}/bins")
+        if bins_root.IsValid():
+            stage.RemovePrim(f"{env_path}/bins")
+        for prim in list(stage.Traverse()):
+            path_str = str(prim.GetPath())
+            if "/bins/bin_" in path_str or prim.GetName().startswith("bin_"):
+                if stage.GetPrimAtPath(path_str).IsValid():
+                    stage.RemovePrim(path_str)
+
+    def setup_scene(self) -> None:
         world = self.get_world()
         env_path = "/World/Ur10Table"
         stage = omni.usd.get_context().get_stage()
 
-        # 1. Удаляем только старые коробки из текущей открытой сцены
-        bins_root = stage.GetPrimAtPath(f"{env_path}/bins")
-        if bins_root.IsValid():
-            stage.RemovePrim(f"{env_path}/bins")
+        self.purge_stale_bins_from_stage(env_path)
+        for legacy in ("/agv", "/World/iw_hub", "/World/GroundPlane"):
+            if stage.GetPrimAtPath(legacy).IsValid():
+                stage.RemovePrim(legacy)
 
-        # Страховка: если при перезапуске остались примы bin_* в сцене
-        for prim in list(stage.Traverse()):
-            path_str = str(prim.GetPath())
-            if "/bins/bin_" in path_str:
-                stage.RemovePrim(path_str)
-
-        # 2. Если стол UR10 и фон уже есть в открытом .usd файле — не дублируем их
         ur10_assets = Ur10Assets()
         if not stage.GetPrimAtPath(env_path).IsValid():
             add_reference_to_stage(usd_path=ur10_assets.ur10_table_usd, prim_path=env_path)
+
+        # Full Simple_Warehouse environment
         if not stage.GetPrimAtPath("/World/Background").IsValid():
             add_reference_to_stage(usd_path=ur10_assets.background_usd, prim_path="/World/Background")
             SingleXFormPrim(
-                "/World/Background", position=[10.00, 2.00, -1.18180], orientation=[0.7071, 0, 0, 0.7071]
+                "/World/Background",
+                position=[10.00, 2.00, -1.18180],
+                orientation=[0.7071, 0.0, 0.0, 0.7071],
             )
 
+        # Inspect idealworks/iwhub folder contents in local Isaac Sim assets
+        iwhub_dir = ur10_assets.assets_root_path + "/Isaac/Robots/Idealworks/iwhub"
+        res_sub, sub_entries = omni.client.list(iwhub_dir)
+        resolved_iwhub_usd = ur10_assets.iw_hub_usd
+        if res_sub == omni.client.Result.OK:
+            names = [e.relative_path for e in sub_entries]
+            print(f"[ASSET] iwhub folder contents: {names}")
+            for fname in names:
+                if fname.endswith(".usd") and "base" not in fname.lower():
+                    resolved_iwhub_usd = f"{iwhub_dir}/{fname}"
+                    break
+
+        # Spawn AGV-01 and AGV-02 idealworks iw.hub rovers and force-load USD payloads
+        for prim_path, pos in [
+            ("/World/iw_hub_01", np.array([-3.20, 2.20, -1.175])),
+            ("/World/iw_hub_02", np.array([-3.20, -2.80, -1.175])),
+        ]:
+            if not stage.GetPrimAtPath(prim_path).IsValid():
+                add_reference_to_stage(usd_path=resolved_iwhub_usd, prim_path=prim_path)
+            prim = stage.GetPrimAtPath(prim_path)
+            if prim.IsValid():
+                prim.Load()
+            SingleXFormPrim(prim_path, position=pos, orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+
+        build_safety_zones_and_personnel(stage, self.safety)
+
+        if world.scene.object_exists("robot"):
+            world.scene.remove_object("robot", registry_only=True)
         self.robot = world.add_robot(CortexUr10(name="robot", prim_path=f"{env_path}/ur10"))
 
-        # Planning obstacles for Cortex motion planner
         obstacles = [
             VisualSphere(
                 "/World/Ur10Table/Obstacles/FlipStationSphere",
@@ -222,7 +348,7 @@ class SmartPalletizing5(CortexBase):
             VisualSphere(
                 "/World/Ur10Table/Obstacles/NavigationDome",
                 name="navigation_dome_obs",
-                position=[-0.031, -0.018, -1.086],
+                position=np.array([-0.031, -0.018, -1.086]),
                 radius=1.1,
                 visible=False,
             ),
@@ -243,7 +369,7 @@ class SmartPalletizing5(CortexBase):
             VisualCapsule(
                 "/World/Ur10Table/Obstacles/NavigationBarrier",
                 name="navigation_barrier_obs",
-                position=[0.471, 0.276, -0.563],
+                position=np.array([0.471, 0.276, -0.563]),
                 orientation=quat,
                 radius=0.5,
                 height=0.9,
@@ -251,56 +377,41 @@ class SmartPalletizing5(CortexBase):
             )
         )
         for obs in obstacles:
-            world.scene.add(obs)
+            if not world.scene.object_exists(obs.name):
+                world.scene.add(obs)
             self.robot.register_obstacle(obs)
 
-        # Ensure /agv prim exists on stage for AGVManager
-        stage = omni.usd.get_context().get_stage()
-        if not stage.GetPrimAtPath("/agv").IsValid():
-            world.scene.add(
-                VisualCuboid(
-                    prim_path="/agv",
-                    name="agv_rover",
-                    position=np.array([-2.5, -0.5, -0.45]),
-                    scale=np.array([0.8, 0.5, 0.3]),
-                    color=np.array([1.0, 0.6, 0.0]),
-                )
-            )
-    def _clear_pallet_only(self):
-        """Clear physical bins and cleanly reset BinStackingContext without touching the robot arm."""
-        if hasattr(self, "decider_network") and self.decider_network is not None:
-            ctx = getattr(self.decider_network, "context", None)
-            if ctx is not None:
-                # 1. Пробуем вызвать штатный метод reset() самого контекста bin_stacking_behavior
-                if hasattr(ctx, "reset") and callable(ctx.reset):
-                    ctx.reset()
-                else:
-                    # 2. Если reset() нет, сбрасываем все поля состояния активной коробки и слотов
-                    for attr in ("active_bin", "in_flip_station", "grasp_bin"):
-                        if hasattr(ctx, attr):
-                            setattr(ctx, attr, None)
-                    for bool_attr in ("has_active_bin", "is_bin_grasped", "is_pallet_full"):
-                        if hasattr(ctx, bool_attr):
-                            setattr(ctx, bool_attr, False)
-                    for list_attr in ("bins", "stacked_bins", "registered_bins"):
-                        if hasattr(ctx, list_attr):
-                            getattr(ctx, list_attr).clear()
+        setup_scene_lighting(stage)
 
-        # 3. Удаляем физические коробки со сцены и разрешаем спавн новых
+    def _reset_bin_stacking_context(self) -> None:
+        world = self.get_world()
+        if world is None or self.robot is None:
+            return
+
+        world._behaviors.clear()
+        world._logical_state_monitors.clear()
+        if hasattr(self.robot, "_decider_networks"):
+            self.robot._decider_networks.clear()
+
+        if hasattr(self.robot, "post_reset"):
+            self.robot.post_reset()
+
+        self.decider_network = behavior.make_decider_network(self.robot, self._on_monitor_update)
+        world.add_decider_network(self.decider_network)
+        world.reset_cortex()
+
+    def _clear_pallet_only(self) -> None:
+        self.agv_01.restore_pallet_nominal_pose()
         if self.task:
-            self.task.post_reset()
+            self.task.reset_pallet_cycle()
+        self._reset_bin_stacking_context()
+        print("[LOGISTICS] Pallet seated at nominal pose and UR10 behavior rebuilt (0/4 slots).")
 
-        print("[LOGISTICS] Pallet and behavior context cleared. Ready for new bins.")
-
-        # 2. Удаляем старые коробки со сцены и разрешаем спавн новых
-        if self.task:
-            self.task.post_reset()
-
-        print("[LOGISTICS] Pallet cleared. Robot arm remains active and ready for new bins.")
-    async def setup_post_load(self):
+    async def setup_post_load(self) -> None:
         world = self.get_world()
         env_path = "/World/Ur10Table"
         ur10_assets = Ur10Assets()
+
         if not self.robot:
             self.robot = world._robots["robot"]
             world._current_tasks.clear()
@@ -314,64 +425,71 @@ class SmartPalletizing5(CortexBase):
         self.decider_network = behavior.make_decider_network(self.robot, self._on_monitor_update)
         world.add_decider_network(self.decider_network)
 
-        # Initialize overhead safety camera
-        self.camera.setup()
+        self.fleet.setup(world=world)
 
-    def _on_monitor_update(self, diagnostics):
+    def _on_monitor_update(self, diagnostics) -> None:
         if self._monitor_fn:
             stack = "\n".join(
                 f"{'  ' * i}{el}" for i, el in enumerate(str(x) for x in self.decider_network._decider_state.stack)
             )
             self._monitor_fn(diagnostics, stack)
 
-    def _on_physics_step(self, step_size):
+    def _on_physics_step(self, step_size: float) -> None:
         world = self.get_world()
         self._frame_counter += 1
 
-        # 1. Update AGV logistics
-        self.agv.update(step_size, spawner_reset_callback=self._clear_pallet_only)
+        # 1. Step all AGVs in the fleet
+        self.fleet.update(step_size, spawner_reset_callback=self._clear_pallet_only)
 
-        # 2. Evaluate safety zones every 30 frames
-        if self._frame_counter % 30 == 0:
-            detected = []
-            if self.agv.state != "IDLE":
-                detected.append({"class": "agv", "pos": (self.agv.current_pos[0], self.agv.current_pos[1])})
+        # 2. Dual-contour safety & CV-vs-Network verification every 20 frames
+        if self._frame_counter % 20 == 0:
+            detections = self.cameras.read_visual_detections_from_stage()
+            telemetry = self.fleet.get_all_telemetry()
 
-            new_state, log_msg = self.safety.evaluate_detected_objects(detected)
+            new_state, log_msg = self.safety.evaluate_detected_objects(detections, agv_telemetry=telemetry)
+            self.fleet.apply_security_halts(self.safety.blocked_agv_ids)
+
             if new_state != self._current_safety_state:
                 self._current_safety_state = new_state
                 print(f"[SAFETY MODULE] Status: {self._current_safety_state} -> {log_msg}")
 
-        # 3. Trigger AGV call when pallet is full
-        if self.task and self.task.pallet_full and self.agv.state == "IDLE":
-            print("[LOGISTICS] Pallet is full! Calling AGV for swap...")
-            self.agv.trigger_pallet_swap()
+        # 3. Dispatch next available authorized AGV (AGV-01 -> AGV-02 -> ...) when pallet is full
+        if self.task and self.task.pallet_full and not self.fleet.has_active_service():
+            dispatched = self.fleet.dispatch_next_available()
+            if dispatched:
+                print(f"[LOGISTICS] Pallet full! Dispatched {dispatched.robot_id} for swap.")
 
-        # 4. Step Cortex / UR10 execution based on safety status and AGV state
-        if self._current_safety_state == "STOP" or self.agv.state != "IDLE":
-            # Freeze robot arm during safety stop or active AGV service
+        # 4. Gate UR10 Cortex execution by safety decision and AGV service status
+        if self._current_safety_state == "STOP" or self.fleet.has_active_service():
             return
 
         if self._current_safety_state == "REDUCED_SPEED":
-            # Skip 2 out of 3 Cortex ticks for smooth 3x speed reduction
             if self._frame_counter % 3 != 0:
                 return
 
-        world.step(False, False)
+        try:
+            world.step(False, False)
+        except AttributeError as exc:
+            if "grasp_T" in str(exc):
+                self._reset_bin_stacking_context()
+            else:
+                raise
 
-    async def on_event_async(self):
+    async def on_event_async(self) -> None:
         world = self.get_world()
         await omni.kit.app.get_app().next_update_async()
         world.reset_cortex()
+        if world.physics_callback_exists("sim_step"):
+            world.remove_physics_callback("sim_step")
         world.add_physics_callback("sim_step", self._on_physics_step)
         await world.play_async()
 
-    async def setup_pre_reset(self):
+    async def setup_pre_reset(self) -> None:
         world = self.get_world()
-        if world.physics_callback_exists("sim_step"):
+        if world and world.physics_callback_exists("sim_step"):
             world.remove_physics_callback("sim_step")
 
-    def world_cleanup(self):
+    def world_cleanup(self) -> None:
         if self.task:
             self.task.world_cleanup()
 
@@ -379,20 +497,19 @@ class SmartPalletizing5(CortexBase):
 # ==============================================================================
 # 4. STANDALONE LAUNCHER FOR ISAAC SIM SCRIPT EDITOR
 # ==============================================================================
-# ==============================================================================
-# 4. STANDALONE LAUNCHER FOR ISAAC SIM SCRIPT EDITOR
-# ==============================================================================
-async def run_standalone():
+async def run_standalone() -> None:
     try:
         from isaacsim.cortex.framework.cortex_world import CortexWorld
 
-        # Останавливаем таймлайн перед зачисткой старых коробок
         timeline = omni.timeline.get_timeline_interface()
         timeline.stop()
         await omni.kit.app.get_app().next_update_async()
 
         if CortexWorld.instance():
             CortexWorld.instance().clear_instance()
+
+        await omni.usd.get_context().new_stage_async()
+        await omni.kit.app.get_app().next_update_async()
 
         world = CortexWorld(stage_units_in_meters=1.0)
         await world.initialize_simulation_context_async()
@@ -406,11 +523,10 @@ async def run_standalone():
         await app.setup_post_load()
         await app.on_event_async()
 
-        print("[SYSTEM] Started on existing stage with old bins cleared!")
+        print("[SYSTEM] SmartPalletizing5 (Multi-AGV A* + 3-Zone Safety + Dual Cameras) started.")
     except Exception:
         print("[ERROR] Failed to launch SmartPalletizing5:")
         traceback.print_exc()
 
 
 asyncio.ensure_future(run_standalone())
-
