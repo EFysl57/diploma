@@ -54,15 +54,13 @@ class SafetyDecisionModule:
     def __init__(
         self,
         robot_origin: Tuple[float, float] = (0.35, 0.45),
-        red_radius: float = 1.35,
-        yellow_radius: float = 2.55,
-        green_radius: float = 3.80,
+        red_radius: float = 2.55,
+        yellow_radius: float = 4.20,
         max_cv_net_pos_error: float = 0.65,
     ):
         self.robot_origin = robot_origin
         self.red_radius = red_radius
         self.yellow_radius = yellow_radius
-        self.green_radius = green_radius
         self.max_cv_net_pos_error = max_cv_net_pos_error
         self.blocked_agv_ids: Set[str] = set()
 
@@ -85,6 +83,23 @@ class SafetyDecisionModule:
             return candidate_state, candidate_msg
         return current_state, current_msg
 
+    def _match_nearest_telemetry_id(
+        self,
+        cv_pos: Tuple[float, float],
+        telemetry_list: List[dict],
+    ) -> Optional[str]:
+        best_id = None
+        best_dist = 0.85
+        for pkt in telemetry_list:
+            net_pos = pkt.get("net_pos")
+            if not net_pos:
+                continue
+            d = math.hypot(cv_pos[0] - net_pos[0], cv_pos[1] - net_pos[1])
+            if d < best_dist:
+                best_dist = d
+                best_id = pkt.get("robot_id")
+        return best_id
+
     def _verify_agv_dual_contour(
         self,
         cv_det: dict,
@@ -95,6 +110,9 @@ class SafetyDecisionModule:
         cv_id = cv_det.get("cv_id", "UNKNOWN")
         cv_pos = cv_det.get("pos", (99.0, 99.0))
         cv_flag = cv_det.get("cv_flag", "UNKNOWN")
+
+        if cv_det.get("unmarked_plate", False):
+            return False, f"Unmarked AGV '{cv_id}' (no side ID plate) in {zone} zone ({dist:.2f}m)"
 
         net_pkt = telemetry_by_id.get(cv_id)
         if net_pkt is None:
@@ -126,7 +144,8 @@ class SafetyDecisionModule:
         if not detected_objects:
             return "NORMAL", "All safety zones clear"
 
-        telemetry_by_id = {pkt["robot_id"]: pkt for pkt in (agv_telemetry or []) if "robot_id" in pkt}
+        telemetry_list = agv_telemetry or []
+        telemetry_by_id = {pkt["robot_id"]: pkt for pkt in telemetry_list if "robot_id" in pkt}
         best_state = "NORMAL"
         best_msg = "All safety zones clear"
 
@@ -137,6 +156,12 @@ class SafetyDecisionModule:
 
             if obj_class == "agv":
                 cv_id = obj.get("cv_id", "UNKNOWN")
+                if cv_id == "UNKNOWN":
+                    matched = self._match_nearest_telemetry_id(pos, telemetry_list)
+                    if matched:
+                        cv_id = matched
+                        obj = dict(obj, cv_id=matched)
+
                 is_valid, verify_msg = self._verify_agv_dual_contour(obj, telemetry_by_id, zone, dist)
                 if not is_valid:
                     self.blocked_agv_ids.add(cv_id)
@@ -152,7 +177,8 @@ class SafetyDecisionModule:
                 continue
 
             if obj_class in self.PERSONNEL_ROLES:
-                if not obj.get("has_helmet", True):
+                # Strict helmet check in YELLOW and RED zones only
+                if zone in ("YELLOW", "RED") and not obj.get("has_helmet", True):
                     return "STOP", f"PPE violation: {obj_class} without helmet in {zone} zone ({dist:.2f}m)"
 
                 action_state, reason = self.ACCESS_MATRIX.get(

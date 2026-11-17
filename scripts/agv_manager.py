@@ -57,10 +57,8 @@ def _generate_number_decal_png(robot_id: str, marker_id: int, out_dir: str) -> O
     img = Image.new("RGBA", (w, h), bg_color)
     draw = ImageDraw.Draw(img)
 
-    # White outer border
     draw.rectangle([6, 6, w - 7, h - 7], outline=(255, 255, 255, 255), width=7)
 
-    # Centered bold white text robot_id
     try:
         font = ImageFont.truetype("arialbd.ttf", 112)
     except Exception:
@@ -82,7 +80,7 @@ class WarehousePathPlanner:
     def __init__(
         self,
         bounds_min: Tuple[float, float] = (-5.5, -4.5),
-        bounds_max: Tuple[float, float] = (3.5, 4.5),
+        bounds_max: Tuple[float, float] = (3.8, 4.5),
         resolution: float = 0.20,
         robot_radius: float = 0.46,
     ):
@@ -103,7 +101,12 @@ class WarehousePathPlanner:
     def grid_to_world(self, gx: int, gy: int) -> Tuple[float, float]:
         return self.min_x + gx * self.res, self.min_y + gy * self.res
 
-    def build_from_stage(self, stage, pallet_xy: Tuple[float, float]) -> None:
+    def build_from_stage(
+        self,
+        stage,
+        pallet_xy: Tuple[float, float],
+        approach_xy: Optional[Tuple[float, float]] = None,
+    ) -> None:
         self.grid.fill(False)
         bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
         obstacle_keywords = ("ur10table", "conveyor", "table", "wall", "rack", "shelf", "pillar", "barrier")
@@ -135,9 +138,18 @@ class WarehousePathPlanner:
 
             self._mark_rect(bmin[0], bmin[1], bmax[0], bmax[1], blocked=True)
 
+        # Keep UR10 table pedestal & conveyor blocked
         self._mark_rect(-0.55, -0.35, 0.22, 1.85, blocked=True)
+
+        # Open longitudinal docking corridor along +X from open end into dolly
         px, py = pallet_xy
-        self._mark_rect(px - 0.62, py - 1.80, px + 0.62, py + 0.18, blocked=False)
+        if approach_xy is not None:
+            ax, ay = approach_xy
+            x0, x1 = min(ax, px) - 0.35, max(ax, px) + 0.35
+            y0, y1 = min(ay, py) - 0.35, max(ay, py) + 0.35
+            self._mark_rect(x0, y0, x1, y1, blocked=False)
+        else:
+            self._mark_rect(px - 0.35, py - 0.42, px + 1.85, py + 0.42, blocked=False)
         self._built = True
 
     def _mark_rect(self, x0: float, y0: float, x1: float, y1: float, blocked: bool) -> None:
@@ -276,8 +288,10 @@ class WarehousePathPlanner:
 
 
 class AGVManager:
-    """Autonomous idealworks iw.hub controller with ground-calibrated stance,
-    flush side decals + ArUco markers, animated wheel rotation, and network identity.
+    """Autonomous idealworks iw.hub controller:
+    - Slides longitudinally under the blue dolly from its open +X end (caster wheels on rover sides)
+    - Lifts & carries the entire blue dolly + pallet + stacked KLT bins together
+    - Restores the dolly + pallet back to native pose after cycle or timeline Stop
     """
 
     CELL_BUSY_STATES = {
@@ -293,6 +307,10 @@ class AGVManager:
         "UNDOCKING",
     }
 
+    @classmethod
+    def capture_or_restore_nominal_carrier(cls, stage) -> None:
+        return None
+
     def __init__(
         self,
         agv_prim_path: str = "/World/iw_hub_01",
@@ -302,8 +320,8 @@ class AGVManager:
         ip_address: str = "192.168.10.101",
         marker_id: int = 1,
         authorized: bool = True,
-        standby_pos: Tuple[float, float, float] = (-3.40, 2.40, -1.18),
-        dropoff_pos: Tuple[float, float, float] = (-3.40, -3.60, -1.18),
+        standby_pos: Tuple[float, float, float] = (-4.25, 2.40, -1.18),
+        dropoff_pos: Tuple[float, float, float] = (-4.25, -3.60, -1.18),
         priority: int = 1,
         wheel_radius: float = 0.085,
         wheel_base: float = 0.58,
@@ -325,11 +343,15 @@ class AGVManager:
         self.wait_pos = np.array(standby_pos, dtype=float)
         self.pallet_pos = np.array([0.688, 0.575, self.floor_z], dtype=float)
         self.dropoff_pos = np.array(dropoff_pos, dtype=float)
-        self.approach_pos = np.array([0.688, -0.85, self.floor_z], dtype=float)
+
+        # Open longitudinal end of the blue dolly is on +X (away from UR10 pedestal at -X)
+        # Rover drives from +X towards -X (yaw = 180 deg) so dolly caster wheels sit on rover left/right sides!
+        self.dock_approach_offset = np.array([1.45, 0.0], dtype=float)
+        self.approach_pos = np.array([0.688 + 1.45, 0.575, self.floor_z], dtype=float)
 
         self.current_pos = self.wait_pos.copy()
         self.current_yaw = 0.0
-        self.carrier_base_yaw = math.pi * 0.5
+        self.carrier_base_yaw = math.pi
 
         self.state = "IDLE"
         self.task_flag = "STANDBY"
@@ -358,6 +380,8 @@ class AGVManager:
         self.min_front_obstacle_dist = 99.0
 
         self._pallet_attached = False
+        self._carrier_moved = False
+        self._native_pose_recorded = False
         self.pallet_init_pos = np.array([0.688, 0.575, -0.82], dtype=float)
         self.pallet_init_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.cart_init_pos: Optional[np.ndarray] = None
@@ -388,8 +412,7 @@ class AGVManager:
         self._discover_wheel_prims(agv_prim)
         self._sync_visual_identity_attrs(agv_prim)
         self.articulation_path = self._find_articulation_root(agv_prim)
-        self._resolve_pallet_and_cart_prims(stage)
-        self._prepare_carrier_kinematics(stage)
+        self._discover_native_carrier_prims(stage)
 
         self.wait_pos[2] = self.floor_z + self.root_z_offset
         self.current_pos = self.wait_pos.copy()
@@ -398,22 +421,32 @@ class AGVManager:
 
         self.pallet_pos[2] = self.floor_z
         self.dropoff_pos[2] = self.floor_z
-        self.approach_pos = np.array([self.pallet_pos[0], self.pallet_pos[1] - 1.40, self.floor_z], dtype=float)
+        self.approach_pos = np.array(
+            [
+                float(self.pallet_pos[0] + self.dock_approach_offset[0]),
+                float(self.pallet_pos[1] + self.dock_approach_offset[1]),
+                self.floor_z,
+            ],
+            dtype=float,
+        )
 
         if planner is not None:
             self.planner = planner
         else:
             self.planner = WarehousePathPlanner()
-            self.planner.build_from_stage(stage, (float(self.pallet_pos[0]), float(self.pallet_pos[1])))
+            self.planner.build_from_stage(
+                stage,
+                (float(self.pallet_pos[0]), float(self.pallet_pos[1])),
+                approach_xy=(float(self.approach_pos[0]), float(self.approach_pos[1])),
+            )
 
         self._set_task_flag("STANDBY")
         print(
             f"[AGV] {self.robot_id} ({self.ip_address}) ready at Z={self.current_pos[2]:.3f} "
-            f"(wheels={len(self._wheel_prims)}, marker_id={self.marker_id})."
+            f"(cart={self.cart_prim_path}, dock_offset=({self.dock_approach_offset[0]:.2f}, {self.dock_approach_offset[1]:.2f}))."
         )
 
     def _calibrate_ground_stance_and_decals(self, stage, agv_prim) -> None:
-        """Measure actual visible mesh bounds of iw_hub safely (ignoring stray helper prims) so wheels sit on floor."""
         self.floor_z = -1.180
 
         xf_root = UsdGeom.Xformable(agv_prim)
@@ -442,7 +475,6 @@ class AGVManager:
                 continue
             bmin = rng.GetMin()
             bmax = rng.GetMax()
-            # Filter out any rogue bounding boxes outside physical rover dimensions (~1.1 x 0.7 x 0.6 m)
             if abs(float(bmin[2])) > 0.30 or abs(float(bmax[2])) > 0.90:
                 continue
             if abs(float(bmax[1])) > 0.60 or abs(float(bmax[0])) > 1.00:
@@ -456,7 +488,6 @@ class AGVManager:
         if min_z_vals and max_z_vals:
             mesh_min_z = min(min_z_vals)
             mesh_max_z = max(max_z_vals)
-            # Clamp offset strictly to [-0.02, +0.08] m so rover can never fly or sink
             self.root_z_offset = float(np.clip(-mesh_min_z + 0.002, -0.02, 0.08))
             half_width_y = float(np.clip(max(max_y_vals), 0.25, 0.35))
             center_x = float(np.mean(x_centers)) if x_centers else 0.0
@@ -477,7 +508,6 @@ class AGVManager:
         center_x: float = 0.0,
         plate_z: float = 0.16,
     ) -> None:
-        """Attach flush, upright, non-mirrored side number + ArUco decals to the rover body."""
         decal_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decals")
         png_path = _generate_number_decal_png(self.robot_id, self.marker_id, decal_dir)
 
@@ -550,6 +580,7 @@ class AGVManager:
             xf.AddTranslateOp().Set(Gf.Vec3d(plate_x, y_offset, plate_z))
 
             UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+
     def _discover_wheel_prims(self, root_prim) -> None:
         self._wheel_prims.clear()
         self._wheel_angles_deg.clear()
@@ -705,7 +736,8 @@ class AGVManager:
             dtype=float,
         )
 
-    def _resolve_pallet_and_cart_prims(self, stage) -> None:
+    def _discover_native_carrier_prims(self, stage) -> None:
+        """Read pallet & blue dolly native world poses without moving them."""
         for path in (self.pallet_prim_path, "/World/Ur10Table/pallet", "/World/Ur10Table/Pallet", "/World/Pallet"):
             prim = stage.GetPrimAtPath(path)
             if prim.IsValid():
@@ -715,49 +747,54 @@ class AGVManager:
                 self.pallet_pos[1] = float(self.pallet_init_pos[1])
                 break
 
-        cart_candidates = []
-        if self.cart_prim_path:
-            cart_candidates.append(self.cart_prim_path)
-        cart_candidates.extend(
-            [
-                "/World/Ur10Table/dolly",
-                "/World/Ur10Table/Dolly",
-                "/World/Ur10Table/cart",
-                "/World/Ur10Table/Cart",
-                "/World/Ur10Table/pallet_cart",
-                "/World/Ur10Table/PalletCart",
-                "/World/Ur10Table/trolley",
-                "/World/Ur10Table/Trolley",
-            ]
-        )
-
         found_cart = None
-        for cpath in cart_candidates:
-            cprim = stage.GetPrimAtPath(cpath)
-            if cprim.IsValid() and str(cprim.GetPath()) != self.pallet_prim_path:
+        if self.cart_prim_path:
+            cprim = stage.GetPrimAtPath(self.cart_prim_path)
+            if cprim.IsValid():
                 found_cart = cprim
-                break
 
         if found_cart is None:
             table_root = stage.GetPrimAtPath("/World/Ur10Table")
             bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+            cart_keywords = ("cart", "dolly", "trolley", "rack", "stand", "holder", "carrier")
             ignore_names = ("ur10", "pallet", "obstacles", "bins", "conveyor", "rail", "flip")
+
             if table_root.IsValid():
-                for child in table_root.GetChildren():
-                    cname = child.GetName().lower()
-                    if any(ig in cname for ig in ignore_names):
+                # 1. Search by explicit cart/dolly/rack naming anywhere under Ur10Table
+                for desc in Usd.PrimRange(table_root):
+                    if desc == table_root or not desc.IsA(UsdGeom.Xformable):
                         continue
-                    rng = bbox_cache.ComputeWorldBound(child).ComputeAlignedRange()
-                    if rng.IsEmpty():
+                    dname = desc.GetName().lower()
+                    if any(ig in dname for ig in ignore_names):
                         continue
-                    center = rng.GetMidpoint()
-                    horiz_dist = math.hypot(
-                        float(center[0]) - float(self.pallet_init_pos[0]),
-                        float(center[1]) - float(self.pallet_init_pos[1]),
-                    )
-                    if horiz_dist < 0.35 and float(center[2]) <= float(self.pallet_init_pos[2]) + 0.05:
-                        found_cart = child
-                        break
+                    if any(kw in dname for kw in cart_keywords):
+                        rng = bbox_cache.ComputeWorldBound(desc).ComputeAlignedRange()
+                        if not rng.IsEmpty():
+                            center = rng.GetMidpoint()
+                            if math.hypot(
+                                float(center[0]) - float(self.pallet_init_pos[0]),
+                                float(center[1]) - float(self.pallet_init_pos[1]),
+                            ) < 0.35:
+                                found_cart = desc
+                                break
+
+                # 2. Fallback: find Xformable directly beneath pallet center
+                if found_cart is None:
+                    for child in table_root.GetChildren():
+                        cname = child.GetName().lower()
+                        if any(ig in cname for ig in ignore_names):
+                            continue
+                        rng = bbox_cache.ComputeWorldBound(child).ComputeAlignedRange()
+                        if rng.IsEmpty():
+                            continue
+                        center = rng.GetMidpoint()
+                        horiz_dist = math.hypot(
+                            float(center[0]) - float(self.pallet_init_pos[0]),
+                            float(center[1]) - float(self.pallet_init_pos[1]),
+                        )
+                        if horiz_dist < 0.25 and float(center[2]) <= float(self.pallet_init_pos[2]) + 0.05:
+                            found_cart = child
+                            break
 
         if found_cart is not None and found_cart.IsValid():
             self.cart_prim_path = str(found_cart.GetPath())
@@ -770,6 +807,20 @@ class AGVManager:
             self.cart_init_pos = None
             self.cart_init_quat = None
             self.cart_xy_offset = np.zeros(2, dtype=float)
+
+        self._native_pose_recorded = True
+        self._carrier_moved = False
+
+    def _capture_native_pose_before_lift(self, stage) -> None:
+        pprim = stage.GetPrimAtPath(self.pallet_prim_path)
+        if pprim.IsValid():
+            self.pallet_init_pos, self.pallet_init_quat = self._read_world_pose(pprim)
+        if self.cart_prim_path:
+            cprim = stage.GetPrimAtPath(self.cart_prim_path)
+            if cprim.IsValid():
+                self.cart_init_pos, self.cart_init_quat = self._read_world_pose(cprim)
+                self.cart_xy_offset = self.cart_init_pos[:2] - self.pallet_init_pos[:2]
+        self._native_pose_recorded = True
 
     def _prepare_carrier_kinematics(self, stage) -> None:
         for p in (self.pallet_prim_path, self.cart_prim_path):
@@ -798,6 +849,11 @@ class AGVManager:
                 pass
 
     def restore_pallet_nominal_pose(self) -> None:
+        self._pallet_attached = False
+        self.lift_height = 0.0
+        if not self._carrier_moved or not self._native_pose_recorded:
+            return
+
         stage = omni.usd.get_context().get_stage()
         if not stage:
             return
@@ -812,6 +868,7 @@ class AGVManager:
                 position=self.cart_init_pos,
                 orientation=self.cart_init_quat,
             )
+        self._carrier_moved = False
 
     def attach_stacked_bins(self, bins: list) -> None:
         self._carried_bins = list(bins) if bins else []
@@ -906,9 +963,10 @@ class AGVManager:
         self._set_bins_kinematic(True)
         self.carrier_base_yaw = float(self.current_yaw)
         self._pallet_attached = True
+        self._carrier_moved = True
         self.cargo_flag = "PALLET_KLT_LOADED"
         self._sync_carried_pallet_pose()
-        print(f"[AGV] {self.robot_id} unified carrier lock engaged (pallet + blue cart + {len(self._carried_bins)} bins).")
+        print(f"[AGV] {self.robot_id} lifted entire blue dolly + pallet (caster wheels on sides).")
 
     def _detach_pallet_joint(self) -> None:
         if not self._pallet_attached:
@@ -917,9 +975,12 @@ class AGVManager:
         self._set_bins_kinematic(False)
         self.cargo_flag = "EMPTY"
         self.restore_pallet_nominal_pose()
-        print(f"[AGV] {self.robot_id} carrier lock released: pallet + blue cart seated at nominal pose.")
+        print(f"[AGV] {self.robot_id} lowered blue dolly + pallet at native pose.")
 
     def _apply_carrier_poses(self, stage, height_m: float) -> None:
+        if height_m > 1e-5 or self._pallet_attached:
+            self._carrier_moved = True
+
         delta_yaw = float(self.current_yaw - self.carrier_base_yaw)
         c, s = math.cos(delta_yaw), math.sin(delta_yaw)
         q_rot = self._yaw_to_quat_wxyz(delta_yaw)
@@ -1002,15 +1063,23 @@ class AGVManager:
 
     def trigger_pallet_swap(self) -> None:
         if self.state == "IDLE":
+            stage = omni.usd.get_context().get_stage()
+            if stage:
+                self._capture_native_pose_before_lift(stage)
             self.approach_pos = np.array(
-                [self.pallet_pos[0], self.pallet_pos[1] - 1.40, self.floor_z + self.root_z_offset], dtype=float
+                [
+                    float(self.pallet_pos[0] + self.dock_approach_offset[0]),
+                    float(self.pallet_pos[1] + self.dock_approach_offset[1]),
+                    self.floor_z + self.root_z_offset,
+                ],
+                dtype=float,
             )
             self._plan_route_to(self.approach_pos)
             self.state = "APPROACHING_PALLET"
             self._set_task_flag("FETCH_FULL_PALLET", cargo_flag="EMPTY")
             print(
                 f"[LOGISTICS] {self.robot_id} ({self.ip_address}) dispatched -> "
-                f"planned A* route ({len(self._active_waypoints)} wps) to pallet."
+                f"longitudinal A* route ({len(self._active_waypoints)} wps) to +X open dolly end."
             )
 
     def trigger_patrol_intrusion(self, target_xy: Tuple[float, float]) -> None:
@@ -1179,13 +1248,17 @@ class AGVManager:
         elif self.state == "ALIGNING_DOCK":
             dx = float(self.pallet_pos[0] - self.current_pos[0])
             dy = float(self.pallet_pos[1] - self.current_pos[1])
-            dock_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.05 else math.pi * 0.5
+            dock_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.05 else math.pi
             if self._align_to_yaw(dock_yaw, tol_deg=1.2, dt=step_dt):
                 self.state = "DOCKING"
 
         elif self.state == "DOCKING":
             if self._drive_towards(self.pallet_pos, self.dock_linear_speed, arrival_tol=0.015, dt=step_dt):
                 self._apply_wheel_velocities(0.0, 0.0, step_dt)
+                stage = omni.usd.get_context().get_stage()
+                if stage:
+                    self._capture_native_pose_before_lift(stage)
+                    self._prepare_carrier_kinematics(stage)
                 self.carrier_base_yaw = float(self.current_yaw)
                 self._set_bins_kinematic(True)
                 self.state = "LIFTING"
@@ -1226,7 +1299,7 @@ class AGVManager:
         elif self.state == "ALIGNING_DOCK_EMPTY":
             dx = float(self.pallet_pos[0] - self.current_pos[0])
             dy = float(self.pallet_pos[1] - self.current_pos[1])
-            dock_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.05 else math.pi * 0.5
+            dock_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 0.05 else math.pi
             if self._align_to_yaw(dock_yaw, tol_deg=1.2, dt=step_dt):
                 self.state = "DOCKING_EMPTY"
 
@@ -1283,10 +1356,23 @@ class AGVFleetManager:
     def setup(self, world=None) -> None:
         stage = omni.usd.get_context().get_stage()
         shared_planner = WarehousePathPlanner()
-        if stage:
-            shared_planner.build_from_stage(stage, (0.688, 0.575))
         for rover in self.rovers:
             rover.setup(world=world, planner=shared_planner)
+        if stage and self.rovers:
+            r0 = self.rovers[0]
+            shared_planner.build_from_stage(
+                stage,
+                (float(r0.pallet_pos[0]), float(r0.pallet_pos[1])),
+                approach_xy=(float(r0.approach_pos[0]), float(r0.approach_pos[1])),
+            )
+
+    def reset_all_carriers_to_nominal(self) -> None:
+        """Restores pallet and blue cart back to their native pose ONLY if an AGV moved them."""
+        for rover in self.rovers:
+            try:
+                rover.restore_pallet_nominal_pose()
+            except Exception:
+                pass
 
     def has_active_service(self) -> bool:
         return any(r.authorized and r.state in AGVManager.CELL_BUSY_STATES for r in self.rovers)

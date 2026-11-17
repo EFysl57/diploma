@@ -5,18 +5,11 @@ import numpy as np
 import omni.usd
 from pxr import Gf, UsdGeom
 
-CameraSensorClass = None
-try:
-    from isaacsim.sensors.camera import Camera as CameraSensorClass
-except ModuleNotFoundError:
-    try:
-        from omni.isaac.sensor import Camera as CameraSensorClass
-    except ModuleNotFoundError:
-        pass
 
-
-class SafetyCamera:
-    """Wrapper for an individual Isaac Sim RGB camera sensor."""
+class LightweightUsdCamera:
+    """Lightweight UsdGeom.Camera wrapper without allocating heavy RTX render products
+    (prevents VRAM exhaustion / ERROR_DEVICE_LOST on 8 GB GPUs).
+    """
 
     def __init__(
         self,
@@ -24,54 +17,38 @@ class SafetyCamera:
         position: Tuple[float, float, float],
         orientation_euler_deg: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         focal_length: float = 12.0,
-        resolution: Tuple[int, int] = (320, 240),
     ):
         self.prim_path = camera_prim_path
         self.position = np.array(position, dtype=float)
         self.orientation_euler_deg = orientation_euler_deg
         self.focal_length = focal_length
-        self.resolution = resolution
-        self.sensor = None
 
     def setup(self) -> None:
         stage = omni.usd.get_context().get_stage()
-        if not stage or CameraSensorClass is None:
-            print(f"[CAMERA ERROR] Unable to initialize {self.prim_path}")
+        if not stage:
+            print(f"[CAMERA ERROR] No active USD stage for {self.prim_path}")
             return
 
-        camera_prim = stage.GetPrimAtPath(self.prim_path)
-        if camera_prim.IsValid():
-            self.sensor = CameraSensorClass(prim_path=self.prim_path, resolution=self.resolution)
-            print(f"[CAMERA] Connected to existing camera: {self.prim_path}")
+        cam_prim = stage.GetPrimAtPath(self.prim_path)
+        if not cam_prim.IsValid():
+            usd_cam = UsdGeom.Camera.Define(stage, self.prim_path)
+            cam_prim = usd_cam.GetPrim()
+            xf = UsdGeom.Xformable(cam_prim)
+            xf.ClearXformOpOrder()
+            xf.AddTranslateOp().Set(Gf.Vec3d(*self.position.tolist()))
+            xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.orientation_euler_deg))
+            print(f"[CAMERA] Created lightweight UsdGeom.Camera: {self.prim_path}")
         else:
-            self.sensor = CameraSensorClass(
-                prim_path=self.prim_path,
-                position=self.position,
-                resolution=self.resolution,
-            )
-            prim = stage.GetPrimAtPath(self.prim_path)
-            if prim.IsValid():
-                xf = UsdGeom.Xformable(prim)
-                xf.ClearXformOpOrder()
-                xf.AddTranslateOp().Set(Gf.Vec3d(*self.position.tolist()))
-                xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.orientation_euler_deg))
-            print(f"[CAMERA] Created camera: {self.prim_path}")
+            usd_cam = UsdGeom.Camera(cam_prim)
+            print(f"[CAMERA] Connected to existing UsdGeom.Camera: {self.prim_path}")
 
-        if hasattr(self.sensor, "set_focal_length"):
-            self.sensor.set_focal_length(self.focal_length)
-        self.sensor.initialize()
-
-    def get_rgb_frame(self) -> Optional[np.ndarray]:
-        if self.sensor is not None and hasattr(self.sensor, "get_rgba"):
-            rgba = self.sensor.get_rgba()
-            if rgba is not None and rgba.size > 0:
-                return rgba[:, :, :3]
-        return None
+        usd_cam.CreateFocalLengthAttr(float(self.focal_length))
+        usd_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 100.0))
 
 
 class DualContourCameraSystem:
-    """Manages both the Overhead Safety Camera (zone/personnel monitoring)
-    and the Side Entrance Camera (AGV side number plate & task verification).
+    """Manages lightweight Overhead and Side UsdGeom cameras and reads ground-truth
+    CV detections directly from the USD stage without GPU render-target overhead.
     """
 
     def __init__(
@@ -79,13 +56,13 @@ class DualContourCameraSystem:
         overhead_path: str = "/World/SafetyCamera_Overhead",
         side_path: str = "/World/SafetyCamera_Side",
     ):
-        self.overhead_cam = SafetyCamera(
+        self.overhead_cam = LightweightUsdCamera(
             camera_prim_path=overhead_path,
-            position=(0.35, 0.30, 6.20),
+            position=(0.35, 0.45, 6.20),
             orientation_euler_deg=(0.0, 0.0, 0.0),
             focal_length=11.0,
         )
-        self.side_cam = SafetyCamera(
+        self.side_cam = LightweightUsdCamera(
             camera_prim_path=side_path,
             position=(2.35, -1.65, -0.45),
             orientation_euler_deg=(78.0, 0.0, 48.0),
@@ -97,10 +74,8 @@ class DualContourCameraSystem:
         self.side_cam.setup()
 
     def capture_frames(self) -> Dict[str, Optional[np.ndarray]]:
-        return {
-            "overhead": self.overhead_cam.get_rgb_frame(),
-            "side": self.side_cam.get_rgb_frame(),
-        }
+        # Intentionally returns None in lightweight mode to keep VRAM footprint zero
+        return {"overhead": None, "side": None}
 
     def read_visual_detections_from_stage(self) -> List[dict]:
         stage = omni.usd.get_context().get_stage()
@@ -132,24 +107,26 @@ class DualContourCameraSystem:
                 id_attr = prim.GetAttribute("agv:robot_id")
                 flag_attr = prim.GetAttribute("agv:status_flag")
                 plate_prim = stage.GetPrimAtPath(f"{prim.GetPath()}/NumberPlate_Left")
-                if not id_attr or not plate_prim.IsValid():
-                    continue
 
-                cv_id = str(id_attr.Get())
-                cv_flag = str(flag_attr.Get()) if flag_attr else "UNKNOWN"
-                trans = xform_cache.GetLocalToWorldTransform(plate_prim).ExtractTranslation()
+                has_plate = plate_prim.IsValid()
+                target_prim = plate_prim if has_plate else prim
+                trans = xform_cache.GetLocalToWorldTransform(target_prim).ExtractTranslation()
+
+                cv_id = str(id_attr.Get()) if (has_plate and id_attr) else "UNKNOWN"
+                cv_flag = str(flag_attr.Get()) if (has_plate and flag_attr) else "UNKNOWN"
 
                 dist_to_side_cam = math.hypot(
                     float(trans[0]) - float(self.side_cam.position[0]),
                     float(trans[1]) - float(self.side_cam.position[1]),
                 )
-                side_verified = dist_to_side_cam <= 4.5
+                side_verified = has_plate and (dist_to_side_cam <= 4.5)
 
                 detections.append(
                     {
                         "class": "agv",
                         "cv_id": cv_id,
                         "cv_flag": cv_flag,
+                        "unmarked_plate": not has_plate,
                         "pos": (float(trans[0]), float(trans[1])),
                         "side_cam_verified": side_verified,
                         "source": "dual_cam" if side_verified else "overhead_cam",
