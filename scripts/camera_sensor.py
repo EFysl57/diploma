@@ -16,12 +16,18 @@ class LightweightUsdCamera:
         camera_prim_path: str,
         position: Tuple[float, float, float],
         orientation_euler_deg: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        scale: Tuple[float, float, float] = (1.0, 1.0, 1.0),
         focal_length: float = 12.0,
+        focus_distance: Optional[float] = None,
+        fstop: Optional[float] = None,
     ):
         self.prim_path = camera_prim_path
         self.position = np.array(position, dtype=float)
         self.orientation_euler_deg = orientation_euler_deg
+        self.scale = scale
         self.focal_length = focal_length
+        self.focus_distance = focus_distance
+        self.fstop = fstop
 
     def setup(self) -> None:
         stage = omni.usd.get_context().get_stage()
@@ -33,16 +39,22 @@ class LightweightUsdCamera:
         if not cam_prim.IsValid():
             usd_cam = UsdGeom.Camera.Define(stage, self.prim_path)
             cam_prim = usd_cam.GetPrim()
-            xf = UsdGeom.Xformable(cam_prim)
-            xf.ClearXformOpOrder()
-            xf.AddTranslateOp().Set(Gf.Vec3d(*self.position.tolist()))
-            xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.orientation_euler_deg))
             print(f"[CAMERA] Created lightweight UsdGeom.Camera: {self.prim_path}")
         else:
             usd_cam = UsdGeom.Camera(cam_prim)
             print(f"[CAMERA] Connected to existing UsdGeom.Camera: {self.prim_path}")
 
+        xf = UsdGeom.Xformable(cam_prim)
+        xf.ClearXformOpOrder()
+        xf.AddTranslateOp().Set(Gf.Vec3d(*self.position.tolist()))
+        xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.orientation_euler_deg))
+        xf.AddScaleOp().Set(Gf.Vec3f(*self.scale))
+
         usd_cam.CreateFocalLengthAttr(float(self.focal_length))
+        if self.focus_distance is not None:
+            usd_cam.CreateFocusDistanceAttr(float(self.focus_distance))
+        if self.fstop is not None:
+            usd_cam.CreateFStopAttr(float(self.fstop))
         usd_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 100.0))
 
 
@@ -60,13 +72,17 @@ class DualContourCameraSystem:
             camera_prim_path=overhead_path,
             position=(0.35, 0.45, 6.20),
             orientation_euler_deg=(0.0, 0.0, 0.0),
+            scale=(1.0, 1.0, 1.0),
             focal_length=11.0,
         )
         self.side_cam = LightweightUsdCamera(
             camera_prim_path=side_path,
-            position=(2.35, -1.65, -0.45),
-            orientation_euler_deg=(78.0, 0.0, 48.0),
-            focal_length=16.0,
+            position=(-6.97198, -8.05845, 4.20584),
+            orientation_euler_deg=(66.38284, 0.0, -35.64631),
+            scale=(1.0, 1.0, 1.0),
+            focal_length=24.0,
+            focus_distance=0.9,
+            fstop=0.0,
         )
 
     def setup(self) -> None:
@@ -119,7 +135,7 @@ class DualContourCameraSystem:
                     float(trans[0]) - float(self.side_cam.position[0]),
                     float(trans[1]) - float(self.side_cam.position[1]),
                 )
-                side_verified = has_plate and (dist_to_side_cam <= 4.5)
+                side_verified = has_plate and (dist_to_side_cam <= 12.5)
 
                 detections.append(
                     {
