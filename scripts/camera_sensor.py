@@ -7,8 +7,8 @@ from pxr import Gf, UsdGeom
 
 
 class LightweightUsdCamera:
-    """Lightweight UsdGeom.Camera wrapper without allocating heavy RTX render products
-    (prevents VRAM exhaustion / ERROR_DEVICE_LOST on 8 GB GPUs).
+    """Lightweight UsdGeom.Camera wrapper that preserves manual viewport transforms
+    if the camera prim already exists in the stage.
     """
 
     def __init__(
@@ -39,23 +39,25 @@ class LightweightUsdCamera:
         if not cam_prim.IsValid():
             usd_cam = UsdGeom.Camera.Define(stage, self.prim_path)
             cam_prim = usd_cam.GetPrim()
+
+            xf = UsdGeom.Xformable(cam_prim)
+            xf.ClearXformOpOrder()
+            xf.AddTranslateOp().Set(Gf.Vec3d(*self.position.tolist()))
+            xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.orientation_euler_deg))
+            xf.AddScaleOp().Set(Gf.Vec3f(*self.scale))
+
+            usd_cam.CreateFocalLengthAttr(float(self.focal_length))
+            if self.focus_distance is not None:
+                usd_cam.CreateFocusDistanceAttr(float(self.focus_distance))
+            if self.fstop is not None:
+                usd_cam.CreateFStopAttr(float(self.fstop))
+            usd_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 100.0))
             print(f"[CAMERA] Created lightweight UsdGeom.Camera: {self.prim_path}")
         else:
-            usd_cam = UsdGeom.Camera(cam_prim)
-            print(f"[CAMERA] Connected to existing UsdGeom.Camera: {self.prim_path}")
-
-        xf = UsdGeom.Xformable(cam_prim)
-        xf.ClearXformOpOrder()
-        xf.AddTranslateOp().Set(Gf.Vec3d(*self.position.tolist()))
-        xf.AddRotateXYZOp().Set(Gf.Vec3f(*self.orientation_euler_deg))
-        xf.AddScaleOp().Set(Gf.Vec3f(*self.scale))
-
-        usd_cam.CreateFocalLengthAttr(float(self.focal_length))
-        if self.focus_distance is not None:
-            usd_cam.CreateFocusDistanceAttr(float(self.focus_distance))
-        if self.fstop is not None:
-            usd_cam.CreateFStopAttr(float(self.fstop))
-        usd_cam.CreateClippingRangeAttr(Gf.Vec2f(0.1, 100.0))
+            # Keep user's manual position/rotation/optics intact and sync live world position
+            w_pos = UsdGeom.XformCache().GetLocalToWorldTransform(cam_prim).ExtractTranslation()
+            self.position = np.array([float(w_pos[0]), float(w_pos[1]), float(w_pos[2])], dtype=float)
+            print(f"[CAMERA] Using existing UsdGeom.Camera transform: {self.prim_path}")
 
 
 class DualContourCameraSystem:
@@ -90,7 +92,6 @@ class DualContourCameraSystem:
         self.side_cam.setup()
 
     def capture_frames(self) -> Dict[str, Optional[np.ndarray]]:
-        # Intentionally returns None in lightweight mode to keep VRAM footprint zero
         return {"overhead": None, "side": None}
 
     def read_visual_detections_from_stage(self) -> List[dict]:

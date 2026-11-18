@@ -748,53 +748,18 @@ class AGVManager:
                 break
 
         found_cart = None
-        if self.cart_prim_path:
-            cprim = stage.GetPrimAtPath(self.cart_prim_path)
-            if cprim.IsValid():
-                found_cart = cprim
+        for cpath in (self.cart_prim_path, "/World/Ur10Table/dolly", "/World/dolly"):
+            if cpath:
+                cprim = stage.GetPrimAtPath(cpath)
+                if cprim.IsValid():
+                    found_cart = cprim
+                    break
 
         if found_cart is None:
-            table_root = stage.GetPrimAtPath("/World/Ur10Table")
-            bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
-            cart_keywords = ("cart", "dolly", "trolley", "rack", "stand", "holder", "carrier")
-            ignore_names = ("ur10", "pallet", "obstacles", "bins", "conveyor", "rail", "flip")
-
-            if table_root.IsValid():
-                # 1. Search by explicit cart/dolly/rack naming anywhere under Ur10Table
-                for desc in Usd.PrimRange(table_root):
-                    if desc == table_root or not desc.IsA(UsdGeom.Xformable):
-                        continue
-                    dname = desc.GetName().lower()
-                    if any(ig in dname for ig in ignore_names):
-                        continue
-                    if any(kw in dname for kw in cart_keywords):
-                        rng = bbox_cache.ComputeWorldBound(desc).ComputeAlignedRange()
-                        if not rng.IsEmpty():
-                            center = rng.GetMidpoint()
-                            if math.hypot(
-                                float(center[0]) - float(self.pallet_init_pos[0]),
-                                float(center[1]) - float(self.pallet_init_pos[1]),
-                            ) < 0.35:
-                                found_cart = desc
-                                break
-
-                # 2. Fallback: find Xformable directly beneath pallet center
-                if found_cart is None:
-                    for child in table_root.GetChildren():
-                        cname = child.GetName().lower()
-                        if any(ig in cname for ig in ignore_names):
-                            continue
-                        rng = bbox_cache.ComputeWorldBound(child).ComputeAlignedRange()
-                        if rng.IsEmpty():
-                            continue
-                        center = rng.GetMidpoint()
-                        horiz_dist = math.hypot(
-                            float(center[0]) - float(self.pallet_init_pos[0]),
-                            float(center[1]) - float(self.pallet_init_pos[1]),
-                        )
-                        if horiz_dist < 0.25 and float(center[2]) <= float(self.pallet_init_pos[2]) + 0.05:
-                            found_cart = child
-                            break
+            for prim in stage.Traverse():
+                if prim.GetName().lower() == "dolly" and prim.IsA(UsdGeom.Xformable):
+                    found_cart = prim
+                    break
 
         if found_cart is not None and found_cart.IsValid():
             self.cart_prim_path = str(found_cart.GetPath())
@@ -869,6 +834,18 @@ class AGVManager:
                 orientation=self.cart_init_quat,
             )
         self._carrier_moved = False
+
+    def reset_to_standby(self) -> None:
+        """Reset rover state and transform back to its native standby spawn pose."""
+        self.state = "IDLE"
+        self._active_waypoints.clear()
+        self.wait_timer = 0.0
+        self.lift_height = 0.0
+        self.current_pos = self.wait_pos.copy()
+        self.current_yaw = 0.0
+        self._set_task_flag("STANDBY", cargo_flag="EMPTY")
+        self._write_root_transform()
+
 
     def attach_stacked_bins(self, bins: list) -> None:
         self._carried_bins = list(bins) if bins else []
@@ -1367,10 +1344,11 @@ class AGVFleetManager:
             )
 
     def reset_all_carriers_to_nominal(self) -> None:
-        """Restores pallet and blue cart back to their native pose ONLY if an AGV moved them."""
+        """Restores pallet, blue cart, and all rovers back to their native spawn poses."""
         for rover in self.rovers:
             try:
                 rover.restore_pallet_nominal_pose()
+                rover.reset_to_standby()
             except Exception:
                 pass
 

@@ -91,8 +91,9 @@ def random_bin_spawn_transform() -> Tuple[np.ndarray, np.ndarray]:
 
 def setup_scene_lighting(stage) -> None:
     lights_root = "/World/Lights"
-    if not stage.GetPrimAtPath(lights_root).IsValid():
-        UsdGeom.Xform.Define(stage, lights_root)
+    if stage.GetPrimAtPath(lights_root).IsValid():
+        return
+    UsdGeom.Xform.Define(stage, lights_root)
     dome = UsdLux.DomeLight.Define(stage, f"{lights_root}/WarehouseDomeLight")
     dome.CreateIntensityAttr(1000.0)
     sun = UsdLux.DistantLight.Define(stage, f"{lights_root}/WarehouseSunLight")
@@ -112,9 +113,9 @@ def _create_smooth_floor_disc(
     opacity: float,
     segments: int = 128,
 ) -> None:
-    """Create a 128-segment completely matte translucent floor disc with zero Fresnel glare."""
+    """Create a 128-segment completely matte translucent floor disc if not already in stage."""
     if stage.GetPrimAtPath(prim_path).IsValid():
-        stage.RemovePrim(prim_path)
+        return
 
     mesh = UsdGeom.Mesh.Define(stage, prim_path)
     points = [Gf.Vec3f(0.0, 0.0, 0.0)]
@@ -204,11 +205,6 @@ def _set_custom_str_or_bool(prim, name: str, value) -> None:
         attr.Set(str(value))
 
 
-def _attach_idle_animation(stage, person_prim, idle_anim_usd: str) -> None:
-    """Keep clean default bind pose without custom joint overrides."""
-    pass
-
-
 def _recolor_character_outfit(
     stage,
     person_prim,
@@ -221,7 +217,6 @@ def _recolor_character_outfit(
     person_path = str(person_prim.GetPath())
     helmet_keywords = ("helmet", "hardhat", "hat", "cap")
 
-    # 1. Shared uniform helmet material for meshes that share materials with the shirt
     helmet_mat_path = f"{person_path}/Looks/UniformHelmetMat"
     helmet_mat = UsdShade.Material.Define(stage, helmet_mat_path)
     helmet_sh = UsdShade.Shader.Define(stage, f"{helmet_mat_path}/PreviewSurface")
@@ -230,7 +225,6 @@ def _recolor_character_outfit(
     helmet_sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.35)
     helmet_mat.CreateSurfaceOutput().ConnectToSource(helmet_sh.ConnectableAPI(), "surface")
 
-    # 2. Toggle helmet visibility & bind uniform helmet color to helmet meshes
     for desc in Usd.PrimRange(person_prim):
         name_low = desc.GetName().lower()
         if any(hw in name_low for hw in helmet_keywords):
@@ -241,7 +235,6 @@ def _recolor_character_outfit(
             if show_helmet and desc.IsA(UsdGeom.Mesh):
                 UsdShade.MaterialBindingAPI.Apply(desc).Bind(helmet_mat)
 
-    # 3. Tint native cloth & helmet materials while preserving fabric textures and creases
     skip_words = (
         "skin", "face", "head", "hair", "eye", "lash", "brow",
         "shoe", "boot", "glove", "hand",
@@ -273,14 +266,13 @@ def _recolor_character_outfit(
 
 
 def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, assets: Ur10Assets) -> None:
+    """Create zones and 4 personnel units ONLY if missing; preserve manual viewport moves."""
     ox, oy = safety_inst.robot_origin
     floor_z = -1.180
 
-    # 1. Completely matte translucent floor discs (Red & Yellow; outside = Green)
     zones_root = "/World/SafetyZones"
-    if stage.GetPrimAtPath(zones_root).IsValid():
-        stage.RemovePrim(zones_root)
-    UsdGeom.Xform.Define(stage, zones_root)
+    if not stage.GetPrimAtPath(zones_root).IsValid():
+        UsdGeom.Xform.Define(stage, zones_root)
 
     _create_smooth_floor_disc(
         stage=stage,
@@ -303,11 +295,9 @@ def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, a
         segments=128,
     )
 
-    # 2. Four 3D personnel characters: Синий, Зеленый, Красный, Желтый + единая белая каска
     personnel_root = "/World/Personnel"
-    if stage.GetPrimAtPath(personnel_root).IsValid():
-        stage.RemovePrim(personnel_root)
-    UsdGeom.Xform.Define(stage, personnel_root)
+    if not stage.GetPrimAtPath(personnel_root).IsValid():
+        UsdGeom.Xform.Define(stage, personnel_root)
 
     char_usds = _resolve_character_usd_paths(assets)
     personnel_spec = [
@@ -317,7 +307,7 @@ def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, a
             True,
             (4.70, 2.20, floor_z),
             char_usds[0],
-            (0.15, 0.38, 0.88),  # Синий — Робототехник
+            (0.15, 0.38, 0.88),
             (0.18, 0.22, 0.35),
         ),
         (
@@ -326,7 +316,7 @@ def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, a
             True,
             (4.70, 0.80, floor_z),
             char_usds[1],
-            (0.18, 0.68, 0.30),  # Зеленый — Тех. персонал
+            (0.18, 0.68, 0.30),
             (0.20, 0.26, 0.22),
         ),
         (
@@ -335,7 +325,7 @@ def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, a
             False,
             (4.70, -0.60, floor_z),
             char_usds[2],
-            (0.88, 0.20, 0.20),  # Красный — Работник склада (без каски)
+            (0.88, 0.20, 0.20),
             (0.24, 0.22, 0.22),
         ),
         (
@@ -344,24 +334,27 @@ def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, a
             True,
             (4.70, -2.00, floor_z),
             char_usds[3],
-            (0.95, 0.80, 0.15),  # Желтый — Электрик
+            (0.95, 0.80, 0.15),
             (0.22, 0.22, 0.25),
         ),
     ]
 
     for prim_name, role_name, has_helmet, pos_xyz, char_usd, top_rgb, pants_rgb in personnel_spec:
         person_path = f"{personnel_root}/{prim_name}"
-        add_reference_to_stage(usd_path=char_usd, prim_path=person_path)
         person_prim = stage.GetPrimAtPath(person_path)
+        is_new = not person_prim.IsValid()
+
+        if is_new:
+            add_reference_to_stage(usd_path=char_usd, prim_path=person_path)
+            person_prim = stage.GetPrimAtPath(person_path)
+            if person_prim.IsValid():
+                person_prim.Load()
+                xf = UsdGeom.Xformable(person_prim)
+                xf.ClearXformOpOrder()
+                xf.AddTranslateOp().Set(Gf.Vec3d(*pos_xyz))
+                xf.AddRotateZOp().Set(180.0)
+
         if person_prim.IsValid():
-            person_prim.Load()
-
-            xf = UsdGeom.Xformable(person_prim)
-            xf.ClearXformOpOrder()
-            xf.AddTranslateOp().Set(Gf.Vec3d(*pos_xyz))
-            xf.AddRotateZOp().Set(180.0)
-
-            _attach_idle_animation(stage, person_prim, assets.idle_anim_usd)
             _recolor_character_outfit(
                 stage=stage,
                 person_prim=person_prim,
@@ -370,9 +363,44 @@ def build_safety_zones_and_personnel(stage, safety_inst: SafetyDecisionModule, a
                 helmet_rgb=(0.95, 0.95, 0.95),
                 show_helmet=has_helmet,
             )
-
             _set_custom_str_or_bool(person_prim, "safety:role", role_name)
             _set_custom_str_or_bool(person_prim, "safety:has_helmet", has_helmet)
+
+
+def align_dolly_under_pallet(stage, env_path: str = "/World/Ur10Table") -> None:
+    """Re-center the blue dolly under /World/Ur10Table/pallet without deleting Ur10Table."""
+    pallet = stage.GetPrimAtPath(f"{env_path}/pallet")
+    table_root = stage.GetPrimAtPath(env_path)
+    if not pallet.IsValid() or not table_root.IsValid():
+        return
+
+    p_pos = UsdGeom.XformCache().GetLocalToWorldTransform(pallet).ExtractTranslation()
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), ["default", "render"])
+
+    for prim in Usd.PrimRange(table_root):
+        if prim == table_root or not prim.IsA(UsdGeom.Xformable):
+            continue
+        name = prim.GetName().lower()
+        if any(k in name for k in ("cart", "dolly", "trolley", "rack", "carrier")):
+            rng = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+            if rng.IsEmpty():
+                continue
+            cur_center = rng.GetMidpoint()
+            dx = float(p_pos[0] - cur_center[0])
+            dy = float(p_pos[1] - cur_center[1])
+            if math.hypot(dx, dy) > 0.02:
+                xf = UsdGeom.Xformable(prim)
+                tf = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+                w_pos = tf.ExtractTranslation()
+                w_rot = tf.ExtractRotationQuat()
+                parent_tf = UsdGeom.XformCache().GetLocalToWorldTransform(prim.GetParent())
+                local_pos = parent_tf.GetInverse().Transform(
+                    Gf.Vec3d(w_pos[0] + dx, w_pos[1] + dy, w_pos[2])
+                )
+                xf.ClearXformOpOrder()
+                xf.AddTranslateOp().Set(local_pos)
+                xf.AddOrientOp().Set(Gf.Quatf(w_rot))
+            break
 
 
 class BinStackingTask(BaseTask):
@@ -501,7 +529,6 @@ class SmartPalletizing5(CortexBase):
         )
         self.camera_system = DualContourCameraSystem()
 
-        # 4 AGVs parked on the left at X = -4.25 (outside Yellow zone radius 4.20 m from X = 0.35)
         rovers_cfg = [
             ("/World/iw_hub_01", "AGV-01", "192.168.10.101", 1, True,  (-4.25,  2.40, -1.18), 1),
             ("/World/iw_hub_02", "AGV-02", "192.168.10.102", 2, True,  (-4.25,  0.80, -1.18), 2),
@@ -542,7 +569,6 @@ class SmartPalletizing5(CortexBase):
                     stage.RemovePrim(path_str)
 
     def _on_timeline_event(self, event) -> None:
-        """Reset blue dolly + pallet back to native pose whenever simulation stops (if moved)."""
         if event.type == int(omni.timeline.TimelineEventType.STOP):
             self.fleet.reset_all_carriers_to_nominal()
 
@@ -567,6 +593,8 @@ class SmartPalletizing5(CortexBase):
         ur10_assets = Ur10Assets()
         if not stage.GetPrimAtPath(env_path).IsValid():
             add_reference_to_stage(usd_path=ur10_assets.ur10_table_usd, prim_path=env_path)
+        else:
+            align_dolly_under_pallet(stage, env_path)
 
         if not stage.GetPrimAtPath("/World/Background").IsValid():
             add_reference_to_stage(usd_path=ur10_assets.background_usd, prim_path="/World/Background")
@@ -585,12 +613,18 @@ class SmartPalletizing5(CortexBase):
                 resolved_iwhub_usd = f"{iwhub_dir}/iw_hub_static.usd"
 
         for rover in self.rovers:
-            if not stage.GetPrimAtPath(rover.prim_path).IsValid():
-                add_reference_to_stage(usd_path=resolved_iwhub_usd, prim_path=rover.prim_path)
             prim = stage.GetPrimAtPath(rover.prim_path)
-            if prim.IsValid():
-                prim.Load()
-            SingleXFormPrim(rover.prim_path, position=rover.wait_pos, orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+            if not prim.IsValid():
+                add_reference_to_stage(usd_path=resolved_iwhub_usd, prim_path=rover.prim_path)
+                prim = stage.GetPrimAtPath(rover.prim_path)
+                if prim.IsValid():
+                    prim.Load()
+            # Always reset rover back to its native standby spawn pose on restart
+            SingleXFormPrim(
+                rover.prim_path,
+                position=rover.wait_pos,
+                orientation=np.array([1.0, 0.0, 0.0, 0.0]),
+            )
 
         build_safety_zones_and_personnel(stage, self.safety, ur10_assets)
         self.camera_system.setup()
@@ -703,6 +737,7 @@ class SmartPalletizing5(CortexBase):
         world.add_decider_network(self.decider_network)
 
         self.fleet.setup(world=world)
+        self.fleet.reset_all_carriers_to_nominal()
         self._register_timeline_reset_hook()
 
     def _on_monitor_update(self, diagnostics) -> None:
@@ -716,14 +751,12 @@ class SmartPalletizing5(CortexBase):
         world = self.get_world()
         self._frame_counter += 1
 
-        # 1. Step all AGVs in the fleet
         self.fleet.update(
             step_size,
             spawner_reset_callback=self._resume_ur10_after_pallet_return,
             unload_bins_callback=self._unload_bins_at_dropoff,
         )
 
-        # 2. Dispatch strictly ONE authorized AGV per full pallet
         if (
             self.task
             and self.task.pallet_full
@@ -735,7 +768,6 @@ class SmartPalletizing5(CortexBase):
                 self._agv_dispatched_for_current_pallet = True
                 print(f"[LOGISTICS] UR10 paused in Idle. Dispatched {dispatched.robot_id} with {len(self.task.bins)} bins.")
 
-        # 3. PAUSE UR10 Cortex while pallet is full or AGV is inside the cell
         if (self.task and self.task.pallet_full) or self.fleet.has_active_service():
             return
 
@@ -744,6 +776,11 @@ class SmartPalletizing5(CortexBase):
     async def on_event_async(self) -> None:
         world = self.get_world()
         await omni.kit.app.get_app().next_update_async()
+        if self.robot and hasattr(self.robot, "suction_gripper") and self.robot.suction_gripper is not None:
+            try:
+                self.robot.suction_gripper.open()
+            except Exception:
+                pass
         world.reset_cortex()
         if world.physics_callback_exists("sim_step"):
             world.remove_physics_callback("sim_step")
@@ -782,8 +819,21 @@ async def run_standalone() -> None:
         if CortexWorld.instance():
             CortexWorld.instance().clear_instance()
 
-        await omni.usd.get_context().new_stage_async()
-        await omni.kit.app.get_app().next_update_async()
+        # Only create a blank stage if no existing scene is currently open
+        stage = omni.usd.get_context().get_stage()
+        has_existing_stage = bool(
+            stage
+            and (
+                stage.GetPrimAtPath("/World/Ur10Table").IsValid()
+                or stage.GetPrimAtPath("/World/Background").IsValid()
+            )
+        )
+
+        if not has_existing_stage:
+            await omni.usd.get_context().new_stage_async()
+            await omni.kit.app.get_app().next_update_async()
+        else:
+            print("[SYSTEM] Preserving currently open USD stage and manual asset placements.")
 
         world = CortexWorld(stage_units_in_meters=1.0)
         await world.initialize_simulation_context_async()
