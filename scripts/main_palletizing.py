@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import math
 import os
 import random
@@ -8,6 +9,11 @@ import traceback
 from typing import Optional, Tuple
 
 sys.dont_write_bytecode = True
+
+os.environ.setdefault("ROS_DOMAIN_ID", "42")
+os.environ.setdefault("ROS_LOCALHOST_ONLY", "0")
+
+from isaacsim.core.utils.types import ArticulationAction
 
 import isaacsim.cortex.framework.math_util as math_util
 import numpy as np
@@ -21,6 +27,7 @@ from isaacsim.core.api.objects.capsule import VisualCapsule
 from isaacsim.core.api.objects.sphere import VisualSphere
 from isaacsim.core.api.tasks.base_task import BaseTask
 from isaacsim.core.prims import SingleXFormPrim
+from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.cortex.behaviors.ur10 import bin_stacking_behavior as behavior
 from isaacsim.cortex.framework.cortex_rigid_prim import CortexRigidPrim
@@ -28,6 +35,11 @@ from isaacsim.cortex.framework.cortex_utils import get_assets_root_path
 from isaacsim.cortex.framework.robot import CortexUr10
 from isaacsim.examples.interactive.cortex.cortex_base import CortexBase
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade
+
+import omni.graph.core as og
+from isaacsim.core.utils.extensions import enable_extension
+
+enable_extension("isaacsim.ros2.bridge")
 
 _candidate_dirs = []
 if "__file__" in globals():
@@ -59,6 +71,136 @@ from agv_manager import AGVFleetManager, AGVManager
 from camera_sensor import DualContourCameraSystem
 from safety_module import SafetyDecisionModule
 
+
+
+
+
+
+SPEED_SCALE_MAP = {
+    "RESUME": 1.0,
+    "SLOWDOWN": 0.25,  
+    "ESTOP": 0.0,
+}
+
+
+class IsaacUr10Ros2Bridge:
+    """Native OmniGraph ROS 2 bridge using generic ROS2Subscriber and ROS2Publisher nodes."""
+
+    VALID_COMMANDS = {"RESUME", "SLOWDOWN", "ESTOP"}
+    GRAPH_PATH = "/World/ROS2_Ur10BridgeGraph"
+
+    def __init__(self, node_name: str = "isaac_ur10_bridge"):
+        self.node_name = node_name
+        self.current_cmd = "RESUME"
+        self.last_cmd_reason = "Default startup state"
+        self.cmd_seq = 0
+        self._last_raw_msg = ""
+        self._active = False
+
+    def start(self) -> bool:
+        try:
+            self.shutdown()
+            domain_id = int(os.environ.get("ROS_DOMAIN_ID", "42"))
+            keys = og.Controller.Keys
+            og.Controller.edit(
+                {"graph_path": self.GRAPH_PATH, "evaluator_name": "execution"},
+                {
+                    keys.CREATE_NODES: [
+                        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                        ("Context", "isaacsim.ros2.bridge.ROS2Context"),
+                        ("SubCmd", "isaacsim.ros2.bridge.ROS2Subscriber"),
+                        ("PubStatus", "isaacsim.ros2.bridge.ROS2Publisher"),
+                    ],
+                    keys.SET_VALUES: [
+                        ("Context.inputs:domain_id", domain_id),
+                        ("Context.inputs:useDomainIDEnvVar", False),
+                        ("SubCmd.inputs:topicName", "/ur10/safety_cmd"),
+                        ("SubCmd.inputs:messagePackage", "std_msgs"),
+                        ("SubCmd.inputs:messageSubfolder", "msg"),
+                        ("SubCmd.inputs:messageName", "String"),
+                        ("PubStatus.inputs:topicName", "/ur10/status"),
+                        ("PubStatus.inputs:messagePackage", "std_msgs"),
+                        ("PubStatus.inputs:messageSubfolder", "msg"),
+                        ("PubStatus.inputs:messageName", "String"),
+                        ("PubStatus.inputs:data", '{"status": "starting"}'),
+                    ],
+                    keys.CONNECT: [
+                        ("OnPlaybackTick.outputs:tick", "SubCmd.inputs:execIn"),
+                        ("OnPlaybackTick.outputs:tick", "PubStatus.inputs:execIn"),
+                        ("Context.outputs:context", "SubCmd.inputs:context"),
+                        ("Context.outputs:context", "PubStatus.inputs:context"),
+                    ],
+                },
+            )
+            self._last_raw_msg = ""
+            self._active = True
+            print(
+                f"[ROS2 BRIDGE] OmniGraph bridge online (ROS_DOMAIN_ID={domain_id}). "
+                f"Sub: /ur10/safety_cmd | Pub: /ur10/status"
+            )
+            return True
+        except Exception as exc:
+            print(f"[ROS2 BRIDGE ERROR] OmniGraph setup failed: {exc}")
+            traceback.print_exc()
+            self._active = False
+            return False
+
+    def spin_once(self) -> None:
+        if not self._active:
+            return
+        try:
+            graph = og.get_graph_by_path(self.GRAPH_PATH)
+            if graph is not None:
+                graph.evaluate()
+            attr = og.Controller.attribute(f"{self.GRAPH_PATH}/SubCmd.outputs:data")
+            if not attr or not attr.is_valid():
+                return
+            raw = str(attr.get() or "").strip()
+            if not raw:
+                return
+
+            cmd_token = raw
+            reason = "External ROS 2 command"
+            if raw.startswith("{"):
+                try:
+                    payload = json.loads(raw)
+                    cmd_token = str(payload.get("cmd", payload.get("command", ""))).strip()
+                    reason = str(payload.get("reason", reason))
+                except Exception:
+                    pass
+
+            normalized = cmd_token.upper()
+            if normalized not in self.VALID_COMMANDS:
+                if raw != self._last_raw_msg:
+                    self._last_raw_msg = raw
+                    print(f"[ROS2 BRIDGE WARN] Ignored invalid safety command: '{raw}'")
+                return
+
+            if normalized != self.current_cmd or raw != self._last_raw_msg:
+                if normalized != self.current_cmd:
+                    print(f"[ROS2 BRIDGE] Safety state transition: {self.current_cmd} -> {normalized} ({reason})")
+                self._last_raw_msg = raw
+                self.current_cmd = normalized
+                self.last_cmd_reason = reason
+                self.cmd_seq += 1
+        except Exception:
+            pass
+
+    def publish_status(self, payload: dict) -> None:
+        if not self._active:
+            return
+        try:
+            attr = og.Controller.attribute(f"{self.GRAPH_PATH}/PubStatus.inputs:data")
+            if attr and attr.is_valid():
+                attr.set(json.dumps(payload, ensure_ascii=True))
+        except Exception:
+            pass
+
+    def shutdown(self) -> None:
+        self._active = False
+        stage = omni.usd.get_context().get_stage()
+        if stage and stage.GetPrimAtPath(self.GRAPH_PATH).IsValid():
+            stage.RemovePrim(self.GRAPH_PATH)
 
 class Ur10Assets:
     def __init__(self):
@@ -528,6 +670,7 @@ class SmartPalletizing5(CortexBase):
             yellow_radius=4.20,
         )
         self.camera_system = DualContourCameraSystem()
+        self.ros_bridge = IsaacUr10Ros2Bridge(node_name="isaac_ur10_bridge")
 
         rovers_cfg = [
             ("/World/iw_hub_01", "AGV-01", "192.168.10.101", 1, True,  (-4.25,  2.40, -1.18), 1),
@@ -551,6 +694,7 @@ class SmartPalletizing5(CortexBase):
         self.fleet = AGVFleetManager(self.rovers)
 
         self._frame_counter = 0
+        self._slowdown_div_counter = 0
         self._agv_dispatched_for_current_pallet = False
         self._timeline_sub = None
 
@@ -619,7 +763,6 @@ class SmartPalletizing5(CortexBase):
                 prim = stage.GetPrimAtPath(rover.prim_path)
                 if prim.IsValid():
                     prim.Load()
-            # Always reset rover back to its native standby spawn pose on restart
             SingleXFormPrim(
                 rover.prim_path,
                 position=rover.wait_pos,
@@ -739,6 +882,7 @@ class SmartPalletizing5(CortexBase):
         self.fleet.setup(world=world)
         self.fleet.reset_all_carriers_to_nominal()
         self._register_timeline_reset_hook()
+        self.ros_bridge.start()
 
     def _on_monitor_update(self, diagnostics) -> None:
         if self._monitor_fn:
@@ -747,10 +891,31 @@ class SmartPalletizing5(CortexBase):
             )
             self._monitor_fn(diagnostics, stack)
 
+    def _publish_ros_status(self, active_cmd: str) -> None:
+        status_payload = {
+            "frame": self._frame_counter,
+            "safety_cmd": active_cmd,
+            "cmd_reason": self.ros_bridge.last_cmd_reason,
+            "cmd_seq": self.ros_bridge.cmd_seq,
+            "pallet_full": bool(self.task.pallet_full) if self.task else False,
+            "bins_placed": len(self.task.bins) if self.task else 0,
+            "agv_service_active": self.fleet.has_active_service(),
+            "fleet": self.fleet.get_all_telemetry(),
+        }
+        self.ros_bridge.publish_status(status_payload)
+
     def _on_physics_step(self, step_size: float) -> None:
         world = self.get_world()
         self._frame_counter += 1
 
+        self.ros_bridge.spin_once()
+        active_cmd = self.ros_bridge.current_cmd
+
+        if self._frame_counter % 15 == 0:
+            self._publish_ros_status(active_cmd)
+
+        # AGV fleet runs independently using its own security rules and LiDAR
+        self.fleet.apply_security_halts(self.safety.blocked_agv_ids)
         self.fleet.update(
             step_size,
             spawner_reset_callback=self._resume_ur10_after_pallet_return,
@@ -766,12 +931,42 @@ class SmartPalletizing5(CortexBase):
             dispatched = self.fleet.dispatch_next_available(stacked_bins=self.task.bins)
             if dispatched:
                 self._agv_dispatched_for_current_pallet = True
-                print(f"[LOGISTICS] UR10 paused in Idle. Dispatched {dispatched.robot_id} with {len(self.task.bins)} bins.")
+                print(
+                    f"[LOGISTICS] UR10 paused in Idle. Dispatched {dispatched.robot_id} "
+                    f"with {len(self.task.bins)} bins."
+                )
 
         if (self.task and self.task.pallet_full) or self.fleet.has_active_service():
             return
 
-        world.step(False, False)
+        # Apply ROS 2 safety commands strictly to UR10 manipulator stepping
+        if active_cmd == "ESTOP":
+            return
+
+        if active_cmd == "SLOWDOWN":
+            robot = getattr(self, "ur10", None) or getattr(self, "robot", None)
+            if robot is None and hasattr(world, "robots") and world.robots:
+                robot = next(iter(world.robots.values()))
+
+            if robot is not None:
+                q_prev = robot.get_joint_positions()
+                world.step(False, False)
+                applied = robot.get_applied_action()
+                q_target = applied.joint_positions if applied is not None else None
+                if q_prev is not None and q_target is not None:
+                    q_prev_arr = np.asarray(q_prev, dtype=np.float64)
+                    q_target_arr = np.asarray(q_target, dtype=np.float64)
+                    q_smooth = q_prev_arr + 0.25 * (q_target_arr - q_prev_arr)
+                    robot.apply_action(
+                        ArticulationAction(
+                            joint_positions=q_smooth,
+                            joint_velocities=np.zeros_like(q_smooth),
+                        )
+                    )
+            else:
+                world.step(False, False)
+        else:
+            world.step(False, False)
 
     async def on_event_async(self) -> None:
         world = self.get_world()
@@ -795,6 +990,7 @@ class SmartPalletizing5(CortexBase):
 
     def world_cleanup(self) -> None:
         self._timeline_sub = None
+        self.ros_bridge.shutdown()
         self.fleet.reset_all_carriers_to_nominal()
         if self.task:
             self.task.world_cleanup()
@@ -813,13 +1009,13 @@ async def run_standalone() -> None:
         await omni.kit.app.get_app().next_update_async()
 
         if APP_INSTANCE is not None:
+            APP_INSTANCE.ros_bridge.shutdown()
             APP_INSTANCE.fleet.reset_all_carriers_to_nominal()
             APP_INSTANCE._timeline_sub = None
 
         if CortexWorld.instance():
             CortexWorld.instance().clear_instance()
 
-        # Only create a blank stage if no existing scene is currently open
         stage = omni.usd.get_context().get_stage()
         has_existing_stage = bool(
             stage
